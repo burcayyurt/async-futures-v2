@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
+from contextlib import suppress
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -80,32 +83,33 @@ class OpenPositionStore:
         return self._path
 
     async def load(self) -> dict[str, ManagedPosition]:
-        if not self._path.exists():
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            await self._write_file(OpenPositionsFile())
-            logger.info("Created empty open positions file at %s", self._path)
-            self._positions = {}
-            return {}
+        async with self._lock:
+            if not self._path.exists():
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                await self._write_file(OpenPositionsFile())
+                logger.info("Created empty open positions file at %s", self._path)
+                self._positions = {}
+                return {}
 
-        def _read() -> tuple[OpenPositionsFile, bool]:
-            raw = self._path.read_text(encoding="utf-8")
-            if not raw.strip():
-                return OpenPositionsFile(), True
-            return OpenPositionsFile.model_validate_json(raw), False
+            def _read() -> tuple[OpenPositionsFile, bool]:
+                raw = self._path.read_text(encoding="utf-8")
+                if not raw.strip():
+                    return OpenPositionsFile(), True
+                return OpenPositionsFile.model_validate_json(raw), False
 
-        try:
-            payload, rewrite_empty = await asyncio.to_thread(_read)
-        except Exception:
-            logger.warning("Failed to read open positions from %s", self._path, exc_info=True)
-            self._positions = {}
-            return {}
+            try:
+                payload, rewrite_empty = await asyncio.to_thread(_read)
+            except Exception:
+                logger.warning("Failed to read open positions from %s", self._path, exc_info=True)
+                self._positions = {}
+                return {}
 
-        loaded = {stored.coin.strip().upper(): managed_from_stored(stored) for stored in payload.positions}
-        self._positions = loaded
-        if rewrite_empty:
-            await self._write_file(OpenPositionsFile())
-        logger.info("Loaded %d open position(s) from %s", len(loaded), self._path)
-        return dict(loaded)
+            loaded = {stored.coin.strip().upper(): managed_from_stored(stored) for stored in payload.positions}
+            self._positions = loaded
+            if rewrite_empty:
+                await self._write_file(OpenPositionsFile())
+            logger.info("Loaded %d open position(s) from %s", len(loaded), self._path)
+            return dict(loaded)
 
     async def upsert(self, position: ManagedPosition) -> None:
         async with self._lock:
@@ -137,11 +141,23 @@ class OpenPositionStore:
             logger.info("Removed open position record for %s from %s", normalized, self._path)
 
     async def _write_file(self, payload: OpenPositionsFile) -> None:
-        def _write() -> None:
+        def _atomic_write() -> None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self._path.parent), suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload.model_dump_json(indent=2))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, str(self._path))
+            except BaseException:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
 
         try:
-            await asyncio.to_thread(_write)
+            await asyncio.to_thread(_atomic_write)
         except OSError:
             logger.warning("Failed to write open positions to %s", self._path, exc_info=True)

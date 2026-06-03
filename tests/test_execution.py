@@ -190,6 +190,7 @@ async def test_trailing_exit_records_closed_trade(
     kill_switch: KillSwitch,
 ) -> None:
     journal = Mock(spec=TradeJournal)
+    journal.record_closed_trade = AsyncMock()
     position_manager = PositionManager(settings, kill_switch, trade_journal=journal)
     exits: list[str] = []
 

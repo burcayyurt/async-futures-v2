@@ -29,6 +29,7 @@ class TelegramNotifier:
         self._token = settings.telegram_bot_token.get_secret_value().strip()
         self._chat_id = settings.telegram_chat_id.strip()
         self._session: aiohttp.ClientSession | None = None
+        self._pending_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def enabled(self) -> bool:
@@ -84,7 +85,9 @@ class TelegramNotifier:
     def notify(self, text: str) -> None:
         if not self.enabled:
             return
-        asyncio.create_task(self._send(text))
+        task = asyncio.create_task(self._send(text))
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
 
     async def send_message(self, text: str) -> None:
         if not self.enabled:
@@ -202,6 +205,9 @@ class TelegramNotifier:
         self.notify(text)
 
     async def close(self) -> None:
+        for task in self._pending_tasks:
+            task.cancel()
+        self._pending_tasks.clear()
         if self._session is not None and not self._session.closed:
             await self._session.close()
             self._session = None

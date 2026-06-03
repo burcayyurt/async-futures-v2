@@ -64,10 +64,11 @@ def test_calc_roe_pct_short_with_leverage() -> None:
     assert roe == Decimal("10")
 
 
-def test_record_and_load_closed_trade(journal: TradeJournal, journal_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_record_and_load_closed_trade(journal: TradeJournal, journal_path: Path) -> None:
     position = _position()
     closed_at = datetime(2026, 6, 1, 12, 45, tzinfo=timezone.utc)
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         position,
         Decimal("101.57"),
         Decimal("1.57"),
@@ -77,7 +78,7 @@ def test_record_and_load_closed_trade(journal: TradeJournal, journal_path: Path)
     )
 
     assert journal_path.exists()
-    trades = journal.load_closed_trades(since=datetime(2026, 6, 1, tzinfo=timezone.utc))
+    trades = await journal.load_closed_trades(since=datetime(2026, 6, 1, tzinfo=timezone.utc))
     assert len(trades) == 1
     assert trades[0].symbol == "AVAX"
     assert trades[0].exit_reason == "trailing_stop"
@@ -85,9 +86,10 @@ def test_record_and_load_closed_trade(journal: TradeJournal, journal_path: Path)
     assert trades[0].dry_run is True
 
 
-def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
+@pytest.mark.asyncio
+async def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
     now = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         _position(),
         Decimal("101"),
         Decimal("1"),
@@ -95,7 +97,7 @@ def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
         "trailing_stop",
         closed_at=now - timedelta(days=1),
     )
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         _position(side=SignalSide.SHORT),
         Decimal("99"),
         Decimal("-0.5"),
@@ -103,7 +105,7 @@ def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
         "stop_loss",
         closed_at=now - timedelta(days=2),
     )
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         _position(),
         Decimal("100"),
         Decimal("0.5"),
@@ -112,7 +114,7 @@ def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
         closed_at=now - timedelta(days=10),
     )
 
-    stats = journal.period_stats(days=7, now=now)
+    stats = await journal.period_stats(days=7, now=now)
     assert stats.trade_count == 2
     assert stats.wins == 1
     assert stats.losses == 1
@@ -120,7 +122,8 @@ def test_period_stats_win_rate_and_net_pnl(journal: TradeJournal) -> None:
     assert stats.net_pnl_usd == Decimal("0.50")
 
 
-def test_load_closed_trades_skips_malformed_lines(journal: TradeJournal, journal_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_load_closed_trades_skips_malformed_lines(journal: TradeJournal, journal_path: Path) -> None:
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     valid = {
         "symbol": "BTC",
@@ -140,14 +143,15 @@ def test_load_closed_trades_skips_malformed_lines(journal: TradeJournal, journal
         encoding="utf-8",
     )
 
-    trades = journal.load_closed_trades(since=datetime(2026, 6, 1, tzinfo=timezone.utc))
+    trades = await journal.load_closed_trades(since=datetime(2026, 6, 1, tzinfo=timezone.utc))
     assert len(trades) == 1
     assert trades[0].symbol == "BTC"
 
 
-def test_load_all_closed_trades(journal: TradeJournal) -> None:
+@pytest.mark.asyncio
+async def test_load_all_closed_trades(journal: TradeJournal) -> None:
     now = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         _position(),
         Decimal("101"),
         Decimal("1"),
@@ -155,7 +159,7 @@ def test_load_all_closed_trades(journal: TradeJournal) -> None:
         "trailing_stop",
         closed_at=now - timedelta(days=30),
     )
-    journal.record_closed_trade(
+    await journal.record_closed_trade(
         _position(coin="ETH"),
         Decimal("102"),
         Decimal("2"),
@@ -163,4 +167,25 @@ def test_load_all_closed_trades(journal: TradeJournal) -> None:
         "trailing_stop",
         closed_at=now - timedelta(days=1),
     )
-    assert len(journal.load_all_closed_trades()) == 2
+    assert len(await journal.load_all_closed_trades()) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_record_writes_are_serialized(journal: TradeJournal) -> None:
+    """Multiple concurrent record_closed_trade calls should not lose data."""
+    import asyncio
+    now = datetime(2026, 6, 8, 12, 0, tzinfo=timezone.utc)
+    tasks = [
+        journal.record_closed_trade(
+            _position(coin=f"C{i}"),
+            Decimal("101"),
+            Decimal("1"),
+            Decimal("10"),
+            "trailing_stop",
+            closed_at=now,
+        )
+        for i in range(10)
+    ]
+    await asyncio.gather(*tasks)
+    trades = await journal.load_all_closed_trades()
+    assert len(trades) == 10

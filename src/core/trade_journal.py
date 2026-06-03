@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -96,12 +97,13 @@ class TradeJournal:
     def __init__(self, settings: HyperliquidSettings, *, path: Path | None = None) -> None:
         self._settings = settings
         self._path = path or Path(settings.trade_journal_path)
+        self._lock = asyncio.Lock()
 
     @property
     def path(self) -> Path:
         return self._path
 
-    def record_closed_trade(
+    async def record_closed_trade(
         self,
         position: ManagedPosition,
         exit_px: Decimal,
@@ -132,50 +134,60 @@ class TradeJournal:
             closed_at=closed_ts,
             dry_run=self._settings.bot_dry_run,
         )
-        try:
+
+        def _append() -> None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(record.to_json_line() + "\n")
+
+        try:
+            async with self._lock:
+                await asyncio.to_thread(_append)
         except OSError:
             logger.warning("Failed to append closed trade to %s", self._path, exc_info=True)
 
-    def load_closed_trades(self, *, since: datetime) -> list[ClosedTradeRecord]:
+    async def load_closed_trades(self, *, since: datetime) -> list[ClosedTradeRecord]:
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
         if not self._path.exists():
             return []
 
-        trades: list[ClosedTradeRecord] = []
-        try:
-            with self._path.open(encoding="utf-8") as handle:
-                for line_no, line in enumerate(handle, start=1):
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        record = ClosedTradeRecord.from_dict(json.loads(stripped))
-                    except (json.JSONDecodeError, KeyError, ValueError):
-                        logger.warning("Skipping malformed trade journal line %s in %s", line_no, self._path)
-                        continue
-                    closed_at = record.closed_at
-                    if closed_at.tzinfo is None:
-                        closed_at = closed_at.replace(tzinfo=timezone.utc)
-                    if closed_at >= since:
-                        trades.append(record)
-        except OSError:
-            logger.warning("Failed to read trade journal from %s", self._path, exc_info=True)
-        return trades
+        since_ts = since
 
-    def load_all_closed_trades(self) -> list[ClosedTradeRecord]:
+        def _read() -> list[ClosedTradeRecord]:
+            trades: list[ClosedTradeRecord] = []
+            try:
+                with self._path.open(encoding="utf-8") as handle:
+                    for line_no, line in enumerate(handle, start=1):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            record = ClosedTradeRecord.from_dict(json.loads(stripped))
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            logger.warning("Skipping malformed trade journal line %s in %s", line_no, self._path)
+                            continue
+                        closed_at = record.closed_at
+                        if closed_at.tzinfo is None:
+                            closed_at = closed_at.replace(tzinfo=timezone.utc)
+                        if closed_at >= since_ts:
+                            trades.append(record)
+            except OSError:
+                logger.warning("Failed to read trade journal from %s", self._path, exc_info=True)
+            return trades
+
+        return await asyncio.to_thread(_read)
+
+    async def load_all_closed_trades(self) -> list[ClosedTradeRecord]:
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        return self.load_closed_trades(since=epoch)
+        return await self.load_closed_trades(since=epoch)
 
-    def period_stats(self, *, days: int = 7, now: datetime | None = None) -> PeriodStats:
+    async def period_stats(self, *, days: int = 7, now: datetime | None = None) -> PeriodStats:
         ts = now or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         since = ts - timedelta(days=days)
-        trades = self.load_closed_trades(since=since)
+        trades = await self.load_closed_trades(since=since)
 
         wins = sum(1 for trade in trades if trade.pnl_usd > 0)
         losses = sum(1 for trade in trades if trade.pnl_usd < 0)

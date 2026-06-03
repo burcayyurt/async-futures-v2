@@ -60,3 +60,44 @@ async def test_remove_deletes_position(store: OpenPositionStore) -> None:
     await store.remove("LINK")
     loaded = await store.load()
     assert "LINK" not in loaded
+
+
+@pytest.mark.asyncio
+async def test_load_recovers_from_corrupted_file(store: OpenPositionStore, store_path: Path) -> None:
+    """Simulates a half-written / corrupted JSON file on disk."""
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text('{"version": 1, "positions": [{', encoding="utf-8")
+    loaded = await store.load()
+    assert loaded == {}
+
+
+@pytest.mark.asyncio
+async def test_load_recovers_from_empty_file(store: OpenPositionStore, store_path: Path) -> None:
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text("", encoding="utf-8")
+    loaded = await store.load()
+    assert loaded == {}
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_leaves_valid_file_on_disk(store: OpenPositionStore, store_path: Path) -> None:
+    """Verify the file on disk is always valid JSON after upsert."""
+    await store.upsert(_position("ETH"))
+    await store.upsert(_position("SOL"))
+
+    import json
+    raw = store_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload["version"] == 1
+    coins = {p["coin"] for p in payload["positions"]}
+    assert coins == {"ETH", "SOL"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_upserts_are_serialized(store: OpenPositionStore) -> None:
+    """Multiple concurrent upserts should not corrupt state."""
+    import asyncio
+    tasks = [store.upsert(_position(f"COIN{i}")) for i in range(10)]
+    await asyncio.gather(*tasks)
+    loaded = await store.load()
+    assert len(loaded) == 10

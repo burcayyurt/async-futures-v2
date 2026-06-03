@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from enum import Enum
 
 import aiohttp
 
 from src.core.config import HyperliquidSettings
+
+logger = logging.getLogger(__name__)
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
@@ -45,6 +48,14 @@ class TelegramCommandPoller:
     def __init__(self, settings: HyperliquidSettings) -> None:
         self._settings = settings
         self._offset: int | None = None
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+        return self._session
 
     async def poll_commands(self) -> list[ParsedTelegramCommand]:
         token = self._settings.telegram_bot_token.get_secret_value().strip()
@@ -56,10 +67,13 @@ class TelegramCommandPoller:
         if self._offset is not None:
             params["offset"] = self._offset
 
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            session = await self._get_session()
             async with session.get(url, params=params) as response:
                 payload = await response.json(content_type=None)
+        except Exception:
+            logger.exception("Telegram poll_commands request failed")
+            return []
 
         if payload.get("ok") is not True:
             return []
@@ -80,3 +94,8 @@ class TelegramCommandPoller:
             if command_type is not None:
                 commands.append(ParsedTelegramCommand(command_type, chat_id, text))
         return commands
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None

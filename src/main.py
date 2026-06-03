@@ -143,9 +143,10 @@ async def heartbeat_worker(
     interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS,
     lookback_days: int = 7,
 ) -> None:
+    await asyncio.sleep(interval_seconds)
     while True:
         open_symbols = sorted(position_manager.positions.keys())
-        stats = trade_journal.period_stats(days=lookback_days)
+        stats = await trade_journal.period_stats(days=lookback_days)
         if open_symbols:
             positions_line = f"Açık Pozisyonlar: {len(open_symbols)} ({', '.join(open_symbols)})"
         else:
@@ -198,15 +199,15 @@ async def telegram_command_worker(
     telegram: TelegramNotifier,
     trade_journal: TradeJournal,
     position_manager: PositionManager,
+    poller: TelegramCommandPoller,
 ) -> None:
-    poller = TelegramCommandPoller(settings)
     while True:
         try:
             commands = await poller.poll_commands()
             for command in commands:
                 if command.command == TelegramCommandType.STATS:
-                    stats = trade_journal.period_stats(days=7)
-                    all_time_count = len(trade_journal.load_all_closed_trades())
+                    stats = await trade_journal.period_stats(days=7)
+                    all_time_count = len(await trade_journal.load_all_closed_trades())
                     await telegram.send_message(format_stats_message(stats, all_time_count=all_time_count))
                 elif command.command == TelegramCommandType.POSITIONS:
                     positions = list(position_manager.positions.values())
@@ -223,12 +224,15 @@ async def shutdown(
     ws: HyperliquidWebSocketListener,
     rest: HyperliquidRestClient,
     telegram: TelegramNotifier,
+    command_poller: TelegramCommandPoller | None = None,
 ) -> None:
     telegram.notify_shutdown()
     await ws.disconnect()
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    if command_poller is not None:
+        await command_poller.close()
     await rest.close()
     await telegram.close()
 
@@ -290,7 +294,8 @@ async def run_bot() -> int:
 
     recovered = await position_manager.recover_positions()
     recovered_symbols = sorted(position.coin for position in recovered)
-    journal_trade_count = len(trade_journal.load_all_closed_trades())
+    all_trades = await trade_journal.load_all_closed_trades()
+    journal_trade_count = len(all_trades)
     telegram.notify_startup(
         symbol_count=len(settings.symbols),
         recovered=recovered_symbols,
@@ -325,6 +330,7 @@ async def run_bot() -> int:
     _install_signal_handlers(loop, shutdown_event)
 
     tasks: list[asyncio.Task[Any]] = []
+    command_poller: TelegramCommandPoller | None = None
 
     try:
         tasks = [
@@ -358,9 +364,10 @@ async def run_bot() -> int:
             ),
         ]
         if telegram.enabled and settings.telegram_poll_enabled:
+            command_poller = TelegramCommandPoller(settings)
             tasks.append(
                 asyncio.create_task(
-                    telegram_command_worker(settings, telegram, trade_journal, position_manager),
+                    telegram_command_worker(settings, telegram, trade_journal, position_manager, command_poller),
                     name="telegram_commands",
                 )
             )
@@ -368,7 +375,7 @@ async def run_bot() -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutdown requested")
     finally:
-        await shutdown(tasks, ws, rest, telegram)
+        await shutdown(tasks, ws, rest, telegram, command_poller=command_poller)
 
     logger.info("Bot stopped cleanly")
     return 0

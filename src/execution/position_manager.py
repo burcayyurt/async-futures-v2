@@ -228,7 +228,7 @@ class PositionManager:
             leverage=self.settings.leverage,
         )
         if self._journal is not None:
-            self._journal.record_closed_trade(position, exit_px, pnl, roe_pct, reason)
+            await self._journal.record_closed_trade(position, exit_px, pnl, roe_pct, reason)
         if self._telegram is not None:
             self._telegram.notify_exit(
                 position.coin,
