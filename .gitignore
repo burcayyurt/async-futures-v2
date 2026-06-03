@@ -1,0 +1,9 @@
+.env
+data/
+.specstory/
+.cursor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

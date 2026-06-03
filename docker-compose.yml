@@ -1,0 +1,9 @@
+services:
+  futures_v2_bot:
+    build: .
+    container_name: futures_v2_bot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
