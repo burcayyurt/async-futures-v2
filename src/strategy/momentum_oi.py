@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import AssetCtxPayload, EventKind, MarketEvent, TradePayload
+from src.strategy.signals import SignalSide, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -47,25 +48,6 @@ class MarketRegime(str, Enum):
     BULLISH = "bullish"
     BEARISH = "bearish"
     NEUTRAL = "neutral"
-
-
-class SignalSide(str, Enum):
-    LONG = "long"
-    SHORT = "short"
-
-
-class TradeSignal(BaseModel):
-    symbol: str
-    side: SignalSide
-    entry_mark_price: Decimal
-    confidence: Decimal = Field(ge=Decimal("0"), le=Decimal("1"))
-    timestamp: datetime
-    reason: str = ""
-
-    model_config = {"arbitrary_types_allowed": True}
-
-
-StrategySignal = TradeSignal
 
 
 @dataclass(slots=True)

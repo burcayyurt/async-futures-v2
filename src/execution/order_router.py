@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -11,7 +12,7 @@ from src.exchange.hyperliquid_rest import HyperliquidRestClient, OrderRequest
 from src.execution.position_manager import ManagedPosition, PositionManager
 from src.risk.kill_switch import ExecutionLockedError, KillSwitch
 from src.risk.margin_manager import MarginManager, MarginSafetyError, MarginSnapshot
-from src.strategy.momentum_oi import SignalSide, TradeSignal
+from src.strategy.signals import SignalSide, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class OrderRouter:
         self.position_manager = position_manager
         self._telegram = telegram
         self.market_slippage_pct = market_slippage_pct
+        self._last_exit_at: dict[str, datetime] = {}
         self.position_manager.bind_exit_handler(self.route_exit)
 
     @staticmethod
@@ -46,6 +48,23 @@ class OrderRouter:
         if is_buy:
             return mark_px * (Decimal("1") + slippage_pct)
         return mark_px * (Decimal("1") - slippage_pct)
+
+    def _in_cooldown(self, coin: str, now: datetime) -> bool:
+        cooldown = self.settings.reentry_cooldown_seconds
+        if cooldown <= 0:
+            return False
+        last = self._last_exit_at.get(coin)
+        if last is None:
+            return False
+        return (now - last).total_seconds() < cooldown
+
+    def _confidence_scaled_size(self, size: float, confidence: Decimal) -> float:
+        if not self.settings.confidence_sizing_enabled:
+            return size
+        floor = self.settings.confidence_size_floor
+        conf = max(Decimal("0"), min(Decimal("1"), confidence))
+        factor = floor + (Decimal("1") - floor) * conf
+        return float(Decimal(str(size)) * factor)
 
     async def _fetch_collateral_snapshot(self) -> MarginSnapshot:
         try:
@@ -81,6 +100,11 @@ class OrderRouter:
             logger.info("Entry skipped for %s: position already open", coin)
             return None
 
+        now = datetime.now(timezone.utc)
+        if self._in_cooldown(coin, now):
+            logger.info("Entry skipped for %s: re-entry cooldown active", coin)
+            return None
+
         snapshot = await self._fetch_collateral_snapshot()
         try:
             size = self.margin_manager.calculate_position_size(
@@ -93,15 +117,26 @@ class OrderRouter:
             logger.warning("Entry rejected for %s: %s", coin, exc)
             return None
 
+        size = self._confidence_scaled_size(size, signal.confidence)
+        if size <= 0:
+            logger.info("Entry skipped for %s: confidence-scaled size is zero", coin)
+            return None
+
         is_buy = signal.side == SignalSide.LONG
-        limit_px = self._slippage_price(signal.entry_mark_price, is_buy, self.market_slippage_pct)
+        if self.settings.maker_entry_enabled:
+            # Passive post-only maker entry at the signal price (no spread cross).
+            limit_px = signal.entry_mark_price
+            tif: str = "Alo"
+        else:
+            limit_px = self._slippage_price(signal.entry_mark_price, is_buy, self.market_slippage_pct)
+            tif = "Ioc"
         order = OrderRequest(
             coin=coin,
             is_buy=is_buy,
             sz=str(size),
             limit_px=str(limit_px),
             reduce_only=False,
-            tif="Ioc",
+            tif=tif,
         )
         result = await self.rest.place_order(order)
 
@@ -110,7 +145,9 @@ class OrderRouter:
             side=signal.side,
             entry_px=signal.entry_mark_price,
             size=Decimal(str(size)),
-            stop_px=PositionManager.initial_stop_price(signal.entry_mark_price, signal.side),
+            stop_px=self.position_manager.compute_initial_stop(
+                coin, signal.entry_mark_price, signal.side
+            ),
             peak_px=signal.entry_mark_price,
         )
         await self.position_manager.register_position(position)
@@ -145,6 +182,7 @@ class OrderRouter:
         )
         result = await self.rest.place_order(order)
         await self.position_manager.remove_position(coin)
+        self._last_exit_at[coin] = datetime.now(timezone.utc)
         logger.info("Exit routed for %s reason=%s result=%s", coin, reason, result.get("status", result))
         return result
 

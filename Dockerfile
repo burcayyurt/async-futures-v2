@@ -10,5 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pyproject.toml .
 COPY src ./src
+COPY backtest ./backtest
 
 CMD ["python", "-m", "src.main"]

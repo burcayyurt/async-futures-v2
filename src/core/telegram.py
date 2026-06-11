@@ -40,6 +40,15 @@ class TelegramNotifier:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    async def _invalidate_session(self) -> None:
+        """Close and discard the current session so the next call gets a fresh connection pool."""
+        if self._session is not None and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = None
+
     def _dry_run_prefix(self) -> str:
         if self._settings.bot_dry_run:
             return "*🧪 [DRY RUN / SANAL İŞLEM]*\n"
@@ -109,6 +118,7 @@ class TelegramNotifier:
                     logger.warning("Telegram sendMessage failed status=%s body=%s", response.status, body)
         except Exception:
             logger.exception("Telegram notification failed")
+            await self._invalidate_session()
 
     def notify_entry(
         self,

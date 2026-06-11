@@ -21,8 +21,11 @@ from src.execution.order_router import OrderRouter
 from src.execution.position_manager import PositionManager
 from src.risk.kill_switch import KillSwitch
 from src.risk.margin_manager import MarginManager
-from src.strategy.momentum_oi import MomentumOIStrategy, TradeSignal
+from src.strategy.dvsla import DvslaParams, DvslaStrategy
+from src.strategy.momentum_oi import MomentumOIStrategy
+from src.strategy.signals import TradeSignal
 from src.telegram.commands import TelegramCommandPoller, TelegramCommandType
+from backtest.recorder import EventRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +81,12 @@ async def market_fanout(
     strategy_q: asyncio.Queue[MarketEvent],
     position_q: asyncio.Queue[MarketEvent],
     risk_q: asyncio.Queue[MarketEvent],
+    recorder: EventRecorder | None = None,
 ) -> None:
     while True:
         event = await source.get()
+        if recorder is not None and event.kind in {EventKind.TRADE, EventKind.ASSET_CTX}:
+            await recorder.record(event)
         if event.kind in {EventKind.TRADE, EventKind.ASSET_CTX}:
             await strategy_q.put(event)
         if event.kind == EventKind.ASSET_CTX:
@@ -177,7 +183,7 @@ async def heartbeat_worker(
 
 
 async def activity_worker(
-    strategy: MomentumOIStrategy,
+    strategy: MomentumOIStrategy | DvslaStrategy,
     position_manager: PositionManager,
     settings: HyperliquidSettings,
     *,
@@ -225,6 +231,7 @@ async def shutdown(
     rest: HyperliquidRestClient,
     telegram: TelegramNotifier,
     command_poller: TelegramCommandPoller | None = None,
+    recorder: EventRecorder | None = None,
 ) -> None:
     telegram.notify_shutdown()
     await ws.disconnect()
@@ -233,6 +240,8 @@ async def shutdown(
     await asyncio.gather(*tasks, return_exceptions=True)
     if command_poller is not None:
         await command_poller.close()
+    if recorder is not None:
+        await recorder.close()
     await rest.close()
     await telegram.close()
 
@@ -287,10 +296,17 @@ async def run_bot() -> int:
     position_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
     risk_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
-    strategy = MomentumOIStrategy(
-        settings,
-        on_signal=lambda sig: signal_queue.put_nowait(sig),
-    )
+    strategy: MomentumOIStrategy | DvslaStrategy
+    if settings.strategy_engine == "dvsla":
+        strategy = DvslaStrategy(
+            DvslaParams.from_settings(settings),
+            on_signal=lambda sig: signal_queue.put_nowait(sig),
+        )
+    else:
+        strategy = MomentumOIStrategy(
+            settings,
+            on_signal=lambda sig: signal_queue.put_nowait(sig),
+        )
 
     recovered = await position_manager.recover_positions()
     recovered_symbols = sorted(position.coin for position in recovered)
@@ -305,29 +321,48 @@ async def run_bot() -> int:
         logger.info("Recovered open positions on startup: %s", ",".join(recovered_symbols))
 
     logger.info(
-        "Bot starting symbols=%s dry_run=%s leverage=%s margin_mode=%s telegram=%s",
+        "Bot starting symbols=%s dry_run=%s leverage=%s margin_mode=%s telegram=%s engine=%s",
         ",".join(settings.symbols),
         settings.bot_dry_run,
         settings.leverage,
         settings.margin_mode,
         "enabled" if telegram.enabled else "disabled",
+        settings.strategy_engine,
     )
-    logger.info(
-        "Strategy params price_delta=%s%% oi_min_increase=%s%% volume_spike=%sx "
-        "window=%ss min_trades=%s ema=%s regime=%s buffer=%s%%",
-        settings.strategy_price_delta_pct,
-        settings.strategy_min_oi_increase_pct,
-        settings.strategy_volume_spike_multiplier,
-        settings.strategy_window_seconds,
-        settings.strategy_min_trades_in_window,
-        settings.strategy_ema_period,
-        settings.strategy_regime_coin,
-        settings.strategy_regime_buffer_pct,
-    )
+    if settings.strategy_engine == "dvsla":
+        logger.info(
+            "DVSLA params vol_bar=%s ret_z_entry=%s flow_imb_min=%s oi_z_drop=%s "
+            "hurst_max=%s warmup=%s cooldown=%s",
+            settings.dvsla_volume_bar_threshold,
+            settings.dvsla_ret_z_entry,
+            settings.dvsla_flow_imbalance_min,
+            settings.dvsla_oi_z_drop,
+            settings.dvsla_hurst_max,
+            settings.dvsla_warmup_bars,
+            settings.dvsla_cooldown_bars,
+        )
+    else:
+        logger.info(
+            "Momentum params price_delta=%s%% oi_min_increase=%s%% volume_spike=%sx "
+            "window=%ss min_trades=%s ema=%s regime=%s buffer=%s%%",
+            settings.strategy_price_delta_pct,
+            settings.strategy_min_oi_increase_pct,
+            settings.strategy_volume_spike_multiplier,
+            settings.strategy_window_seconds,
+            settings.strategy_min_trades_in_window,
+            settings.strategy_ema_period,
+            settings.strategy_regime_coin,
+            settings.strategy_regime_buffer_pct,
+        )
 
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop, shutdown_event)
+
+    recorder: EventRecorder | None = None
+    if settings.record_events:
+        recorder = EventRecorder(settings.recordings_dir)
+        logger.info("Event recording enabled -> %s", settings.recordings_dir)
 
     tasks: list[asyncio.Task[Any]] = []
     command_poller: TelegramCommandPoller | None = None
@@ -336,7 +371,7 @@ async def run_bot() -> int:
         tasks = [
             asyncio.create_task(ws.run(), name="ws"),
             asyncio.create_task(
-                market_fanout(ws.queue, strategy_queue, position_queue, risk_queue),
+                market_fanout(ws.queue, strategy_queue, position_queue, risk_queue, recorder),
                 name="market_fanout",
             ),
             asyncio.create_task(strategy.consume(strategy_queue), name="strategy"),
@@ -375,7 +410,7 @@ async def run_bot() -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutdown requested")
     finally:
-        await shutdown(tasks, ws, rest, telegram, command_poller=command_poller)
+        await shutdown(tasks, ws, rest, telegram, command_poller=command_poller, recorder=recorder)
 
     logger.info("Bot stopped cleanly")
     return 0

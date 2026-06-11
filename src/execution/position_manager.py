@@ -13,7 +13,8 @@ from src.core.telegram import TelegramNotifier
 from src.core.trade_journal import TradeJournal, calc_roe_pct
 from src.exchange.hyperliquid_ws import AssetCtxPayload, EventKind, MarketEvent
 from src.risk.kill_switch import KillSwitch
-from src.strategy.momentum_oi import SignalSide
+from src.strategy.microstructure import RollingStats
+from src.strategy.signals import SignalSide
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,43 @@ INITIAL_STOP_PCT = Decimal("0.02")
 PEAK_PERSIST_DEBOUNCE_SECONDS = 5.0
 
 ExitHandler = Callable[["ManagedPosition", str], Awaitable[None]]
+
+
+class _MarkTracker:
+    """Per-symbol rolling mark-price stats for ATR-stop and reversion-TP.
+
+    Given the FAZ-0-Lite feed (no L2, asset_ctx mark prints only) we approximate
+    a volatility band ("ATR proxy") from the rolling mean absolute mark return,
+    and a reversion target from the rolling mean mark price. True volume-ATR is
+    computed in the strategy/backtest where the trade tape is available.
+    """
+
+    __slots__ = ("_prices", "_abs_returns", "_prev")
+
+    def __init__(self, atr_window: int, reversion_window: int) -> None:
+        self._prices = RollingStats(reversion_window)
+        self._abs_returns = RollingStats(atr_window)
+        self._prev: Decimal | None = None
+
+    def update(self, mark_px: Decimal) -> None:
+        if mark_px <= 0:
+            return
+        self._prices.update(float(mark_px))
+        if self._prev is not None and self._prev > 0:
+            self._abs_returns.update(abs(float((mark_px - self._prev) / self._prev)))
+        self._prev = mark_px
+
+    @property
+    def reversion_target(self) -> Decimal | None:
+        if self._prices.count < 2:
+            return None
+        return Decimal(str(self._prices.mean))
+
+    @property
+    def atr_pct(self) -> Decimal | None:
+        if self._abs_returns.count < 2:
+            return None
+        return Decimal(str(self._abs_returns.mean))
 
 
 @dataclass(slots=True)
@@ -57,6 +95,7 @@ class PositionManager:
         self._exit_handler: ExitHandler | None = None
         self._panic_in_progress = False
         self._last_peak_persist: dict[str, datetime] = {}
+        self._mark_trackers: dict[str, _MarkTracker] = {}
 
     @property
     def positions(self) -> dict[str, ManagedPosition]:
@@ -133,6 +172,58 @@ class PositionManager:
             return
         self._last_peak_persist[coin] = now
         await self._open_store.upsert(position)
+
+    def _tracker(self, coin: str) -> _MarkTracker:
+        normalized = coin.strip().upper()
+        tracker = self._mark_trackers.get(normalized)
+        if tracker is None:
+            tracker = _MarkTracker(self.settings.atr_window, self.settings.reversion_window)
+            self._mark_trackers[normalized] = tracker
+        return tracker
+
+    def compute_initial_stop(self, coin: str, entry_px: Decimal, side: SignalSide) -> Decimal:
+        """Volatility-aware initial stop; falls back to the fixed-pct stop.
+
+        When ``atr_stop_enabled`` and enough mark history exists, the stop is
+        placed ``atr_stop_mult`` ATR-proxy widths from entry, but never closer
+        than ``atr_stop_min_pct``. The ATR proxy is derived from per-tick mark
+        returns, so without that floor the stop hugs the entry and any tick of
+        noise stops the position out instantly. Otherwise the legacy
+        :meth:`initial_stop_price` (fixed ``INITIAL_STOP_PCT``) is used.
+        """
+
+        if self.settings.atr_stop_enabled:
+            atr_pct = self._tracker(coin).atr_pct
+            if atr_pct is not None and atr_pct > 0:
+                dist = atr_pct * self.settings.atr_stop_mult
+                dist = max(dist, self.settings.atr_stop_min_pct)
+                if side == SignalSide.LONG:
+                    return entry_px * (Decimal("1") - dist)
+                return entry_px * (Decimal("1") + dist)
+        return self.initial_stop_price(entry_px, side)
+
+    def _reversion_take_profit(
+        self, position: ManagedPosition, mark_px: Decimal
+    ) -> Decimal | None:
+        """Return an exit price if the mean-reversion target has been reached.
+
+        Only fires in profit (the hard/trailing stop handles adverse moves), so a
+        long faded below the mean exits once price recovers to the mean, and a
+        short faded above the mean exits once price falls back to it.
+        """
+
+        if not self.settings.reversion_tp_enabled:
+            return None
+        target = self._tracker(position.coin).reversion_target
+        if target is None:
+            return None
+        if position.side == SignalSide.LONG:
+            if mark_px >= target and mark_px > position.entry_px:
+                return mark_px
+        else:
+            if mark_px <= target and mark_px < position.entry_px:
+                return mark_px
+        return None
 
     def _gain_pct(self, position: ManagedPosition, mark_px: Decimal) -> Decimal:
         if position.entry_px <= 0:
@@ -264,6 +355,10 @@ class PositionManager:
             return
 
         normalized = coin.strip().upper()
+        # Keep the volatility / reversion trackers warm even before a position
+        # exists, so ATR-stop and reversion-TP are ready the moment one opens.
+        self._tracker(normalized).update(mark_px)
+
         position = self._positions.get(normalized)
         if position is None:
             return
@@ -277,6 +372,11 @@ class PositionManager:
 
         if self._hit_hard_stop(position, mark_px):
             await self._request_exit(position, "stop_loss", exit_px=mark_px)
+            return
+
+        reversion_px = self._reversion_take_profit(position, mark_px)
+        if reversion_px is not None:
+            await self._request_exit(position, "reversion_tp", exit_px=reversion_px)
             return
 
         trail_trigger = await self.maybe_trail_stop(position, mark_px)
