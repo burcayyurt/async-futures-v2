@@ -10,7 +10,9 @@ from decimal import Decimal
 from typing import Any
 
 from src.core.config import HyperliquidSettings
+from src.core.config_fingerprint import register_config
 from src.core.logger import setup_logging
+from src.core.session_log import SessionTracker
 from src.core.open_position_store import OpenPositionStore
 from src.core.telegram import TelegramNotifier
 from src.telegram.messages import format_help_message, format_positions_message, format_stats_message
@@ -22,6 +24,7 @@ from src.execution.position_manager import PositionManager
 from src.risk.kill_switch import KillSwitch
 from src.risk.margin_manager import MarginManager
 from src.strategy.dvsla import DvslaParams, DvslaStrategy
+from src.strategy.market_breadth import MarketBreadthTracker
 from src.strategy.momentum_oi import MomentumOIStrategy
 from src.strategy.signals import TradeSignal
 from src.telegram.commands import TelegramCommandPoller, TelegramCommandType
@@ -188,6 +191,7 @@ async def activity_worker(
     settings: HyperliquidSettings,
     *,
     interval_seconds: int = ACTIVITY_LOG_INTERVAL_SECONDS,
+    session: SessionTracker | None = None,
 ) -> None:
     await asyncio.sleep(interval_seconds)
     while True:
@@ -197,6 +201,10 @@ async def activity_worker(
             ",".join(open_positions) if open_positions else "none",
             strategy.decision_summary(settings.symbols),
         )
+        if session is not None:
+            # Refreshing here means an unclean stop is dated to within one
+            # activity interval, which is accurate enough for coverage.
+            await session.touch()
         await asyncio.sleep(interval_seconds)
 
 
@@ -281,6 +289,9 @@ async def run_bot() -> int:
         telegram=telegram,
         trade_journal=trade_journal,
         open_position_store=open_position_store,
+        # Live mode reconciles the disk record against the exchange on startup;
+        # dry-run ignores this and trusts the disk record.
+        exchange_positions=rest.get_open_positions,
     )
     order_router = OrderRouter(
         settings,
@@ -289,6 +300,7 @@ async def run_bot() -> int:
         margin_manager,
         position_manager,
         telegram=telegram,
+        feed_health=ws.seconds_since_connect,
     )
 
     signal_queue: asyncio.Queue[TradeSignal] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
@@ -296,16 +308,25 @@ async def run_bot() -> int:
     position_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
     risk_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
+    breadth: MarketBreadthTracker | None = None
+    if settings.correlation_guard_enabled:
+        breadth = MarketBreadthTracker(
+            window_seconds=settings.correlation_window_seconds,
+            max_same_side=settings.correlation_max_same_side,
+        )
+
     strategy: MomentumOIStrategy | DvslaStrategy
     if settings.strategy_engine == "dvsla":
         strategy = DvslaStrategy(
             DvslaParams.from_settings(settings),
             on_signal=lambda sig: signal_queue.put_nowait(sig),
+            breadth=breadth,
         )
     else:
         strategy = MomentumOIStrategy(
             settings,
             on_signal=lambda sig: signal_queue.put_nowait(sig),
+            breadth=breadth,
         )
 
     recovered = await position_manager.recover_positions()
@@ -316,9 +337,22 @@ async def run_bot() -> int:
         symbol_count=len(settings.symbols),
         recovered=recovered_symbols,
         journal_trade_count=journal_trade_count,
+        engine=settings.strategy_engine,
     )
     if recovered_symbols:
         logger.info("Recovered open positions on startup: %s", ",".join(recovered_symbols))
+
+    # Record which parameter set this run uses, so the trades it books stay
+    # attributable after the configuration changes.
+    active_config_id = register_config(settings, settings.config_registry_path)
+    logger.info("Active config_id=%s (registry: %s)", active_config_id, settings.config_registry_path)
+
+    # Opening the session also rolls any previous run's marker into the log, so
+    # an outage shows up as a gap rather than silently vanishing.
+    session_tracker = SessionTracker(
+        log_path=settings.session_log_path, state_path=settings.session_state_path
+    )
+    await session_tracker.begin(active_config_id)
 
     logger.info(
         "Bot starting symbols=%s dry_run=%s leverage=%s margin_mode=%s telegram=%s engine=%s",
@@ -394,7 +428,7 @@ async def run_bot() -> int:
                 name="heartbeat",
             ),
             asyncio.create_task(
-                activity_worker(strategy, position_manager, settings),
+                activity_worker(strategy, position_manager, settings, session=session_tracker),
                 name="activity",
             ),
         ]
@@ -411,6 +445,9 @@ async def run_bot() -> int:
         logger.info("Shutdown requested")
     finally:
         await shutdown(tasks, ws, rest, telegram, command_poller=command_poller, recorder=recorder)
+        # Mark the session closed last, so an exception during shutdown still
+        # leaves the run recorded as unclean rather than silently complete.
+        await session_tracker.finish()
 
     logger.info("Bot stopped cleanly")
     return 0

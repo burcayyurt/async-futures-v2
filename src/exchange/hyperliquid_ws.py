@@ -95,6 +95,7 @@ class HyperliquidWebSocketListener:
         self._queue = queue or asyncio.Queue(maxsize=queue_maxsize)
         self._on_tick = on_tick
         self._connected = False
+        self._connected_at: datetime | None = None
         self._ws: ClientConnection | None = None
         self._stop_event = asyncio.Event()
         self._subscriptions: set[_Subscription] = set()
@@ -116,6 +117,22 @@ class HyperliquidWebSocketListener:
     def is_connected(self) -> bool:
         return self._connected
 
+    @property
+    def connected_at(self) -> datetime | None:
+        return self._connected_at
+
+    def seconds_since_connect(self, now: datetime | None = None) -> float | None:
+        """Seconds since the current connection was (re)established.
+
+        Returns ``None`` when the feed is down. Used by the order router to
+        suppress new entries during the post-reconnect warm-up window, so the
+        strategy does not fire on stale/burst data after a 502 blackout.
+        """
+        if not self._connected or self._connected_at is None:
+            return None
+        reference = now or datetime.now(timezone.utc)
+        return (reference - self._connected_at).total_seconds()
+
     def _register_symbol_subscriptions(self, coin: str) -> None:
         normalized = coin.strip().upper()
         if not normalized:
@@ -128,11 +145,15 @@ class HyperliquidWebSocketListener:
             return
         self._ws = await websockets.connect(
             self.settings.ws_url,
-            ping_interval=20,
-            ping_timeout=20,
+            # Tightened from 20/20: detect a dead connection ~2x faster so a
+            # silently-stalled feed (e.g. after an upstream 502) is torn down and
+            # reconnected before the strategy runs too long on frozen data.
+            ping_interval=10,
+            ping_timeout=10,
             close_timeout=5,
         )
         self._connected = True
+        self._connected_at = datetime.now(timezone.utc)
         self._backoff_seconds = BACKOFF_BASE_SECONDS
         await self._send_all_subscriptions()
         logger.info(
@@ -145,6 +166,7 @@ class HyperliquidWebSocketListener:
     async def disconnect(self) -> None:
         self._stop_event.set()
         self._connected = False
+        self._connected_at = None
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
@@ -180,6 +202,7 @@ class HyperliquidWebSocketListener:
                     logger.exception("WebSocket connection error; reconnecting")
             finally:
                 self._connected = False
+                self._connected_at = None
                 if self._ws is not None:
                     try:
                         await self._ws.close()

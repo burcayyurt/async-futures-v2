@@ -166,15 +166,17 @@ class TelegramNotifier:
         symbol_count: int,
         recovered: list[str],
         journal_trade_count: int,
+        engine: str | None = None,
     ) -> None:
         mode = "DRY RUN (Sanal)" if self._settings.bot_dry_run else "LIVE"
+        engine_label = f" | Motor: {engine.upper()}" if engine else ""
         if recovered:
             recovered_line = f"Geri yüklenen pozisyon: {len(recovered)} ({', '.join(recovered)})"
         else:
             recovered_line = "Geri yüklenen pozisyon: 0"
         text = (
             f"✅ *HL Futures Bot Başladı*\n"
-            f"Mod: {mode} | Coin: {symbol_count}\n"
+            f"Mod: {mode} | Coin: {symbol_count}{engine_label}\n"
             f"{recovered_line}\n"
             f"Kayıtlı kapalı işlem: {journal_trade_count}\n"
             f"Komutlar: /stats /positions /help"

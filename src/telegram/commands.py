@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum
 
 import aiohttp
@@ -45,10 +46,47 @@ def parse_command_text(text: str) -> TelegramCommandType | None:
 
 
 class TelegramCommandPoller:
+    # Telegram is a notification side-channel: when it is unreachable the bot
+    # keeps trading, so an outage must stay quiet rather than emit a traceback
+    # every poll. Days of that would bury a real error in the log.
+    BACKOFF_BASE_SECONDS = 15.0
+    BACKOFF_MAX_SECONDS = 900.0
+    LOG_EVERY_N_FAILURES = 20
+
     def __init__(self, settings: HyperliquidSettings) -> None:
         self._settings = settings
         self._offset: int | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._consecutive_failures = 0
+        self._retry_at: float = 0.0
+
+    def _note_failure(self) -> None:
+        """Record a failed poll and schedule the next attempt."""
+        self._consecutive_failures += 1
+        delay = min(
+            self.BACKOFF_BASE_SECONDS * (2 ** (self._consecutive_failures - 1)),
+            self.BACKOFF_MAX_SECONDS,
+        )
+        self._retry_at = time.monotonic() + delay
+        # Full detail on the first failure, then only occasionally: enough to
+        # show the outage is ongoing without drowning everything else.
+        if self._consecutive_failures == 1:
+            logger.exception("Telegram poll failed; backing off %.0fs", delay)
+        elif self._consecutive_failures % self.LOG_EVERY_N_FAILURES == 0:
+            logger.warning(
+                "Telegram still unreachable after %d attempts; retrying in %.0fs",
+                self._consecutive_failures,
+                delay,
+            )
+
+    def _note_success(self) -> None:
+        if self._consecutive_failures:
+            logger.info(
+                "Telegram reachable again after %d failed attempt(s)",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+        self._retry_at = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -62,6 +100,9 @@ class TelegramCommandPoller:
         if not token:
             return []
 
+        if self._retry_at and time.monotonic() < self._retry_at:
+            return []
+
         url = f"{TELEGRAM_API_BASE}/bot{token}/getUpdates"
         params: dict[str, str | int] = {"timeout": 0}
         if self._offset is not None:
@@ -72,8 +113,10 @@ class TelegramCommandPoller:
             async with session.get(url, params=params) as response:
                 payload = await response.json(content_type=None)
         except Exception:
-            logger.exception("Telegram poll_commands request failed")
+            self._note_failure()
             return []
+
+        self._note_success()
 
         if payload.get("ok") is not True:
             return []
