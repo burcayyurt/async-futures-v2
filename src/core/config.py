@@ -53,6 +53,17 @@ class HyperliquidSettings(BaseSettings):
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
     trade_journal_path: str = Field(default="data/trades.jsonl", validation_alias="TRADE_JOURNAL_PATH")
     open_positions_path: str = Field(default="data/open_positions.json", validation_alias="OPEN_POSITIONS_PATH")
+    # Maps each trade's config_id back to the parameters that produced it.
+    config_registry_path: str = Field(
+        default="data/config_registry.jsonl", validation_alias="CONFIG_REGISTRY_PATH"
+    )
+    # Run windows, used to measure how much of the observation span was covered.
+    session_log_path: str = Field(
+        default="data/sessions.jsonl", validation_alias="SESSION_LOG_PATH"
+    )
+    session_state_path: str = Field(
+        default="data/session_state.json", validation_alias="SESSION_STATE_PATH"
+    )
 
     record_events: bool = Field(default=False, validation_alias="RECORD_EVENTS")
     recordings_dir: str = Field(default="data/recordings", validation_alias="RECORDINGS_DIR")
@@ -71,13 +82,39 @@ class HyperliquidSettings(BaseSettings):
     )
     trailing_callback_pct: Decimal = Field(
         default=Decimal("0.0015"),
-        gt=Decimal("0"),
+        # 0 disables the trail entirely, which the horizon-exit configuration
+        # needs; a positive floor would make that configuration unreachable.
+        ge=Decimal("0"),
         validation_alias="TRAILING_CALLBACK_PCT",
     )
     break_even_trigger_pct: Decimal = Field(
         default=Decimal("0.1"),
         ge=Decimal("0"),
         validation_alias="BREAK_EVEN_TRIGGER_PCT",
+    )
+
+    # --- Feed-health guards. A 502/blackout on the Hyperliquid WS leaves the
+    # strategy running on stale data and the position manager unable to trail
+    # stops. After a (re)connect we suppress new entries for a warm-up window,
+    # and we refuse to fire a hard stop on the first gapped mark that arrives
+    # after a data blackout (it would exit at a discontinuous price). ---
+    ws_reconnect_entry_cooldown_seconds: int = Field(
+        default=15, ge=0, validation_alias="WS_RECONNECT_ENTRY_COOLDOWN_SECONDS"
+    )
+    mark_staleness_gap_seconds: Decimal = Field(
+        default=Decimal("5.0"), ge=Decimal("0"), validation_alias="MARK_STALENESS_GAP_SECONDS"
+    )
+    # Minimum time a freshly opened position must be held before a hard stop can
+    # fire (kill-switch always overrides). Guards against 1-tick whipsaw exits.
+    min_hold_seconds: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), validation_alias="MIN_HOLD_SECONDS"
+    )
+    # Close a position this many seconds after entry regardless of price. 0 = off.
+    # The DVSLA signal's forward edge peaks around 30-60s and decays after, so a
+    # horizon exit captures it where a trail cannot: a trail seeded at the entry
+    # price truncates exactly the upside the signal predicts.
+    max_hold_seconds: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), validation_alias="MAX_HOLD_SECONDS"
     )
 
     strategy_window_seconds: int = Field(default=60, gt=0, validation_alias="STRATEGY_WINDOW_SECONDS")
@@ -109,8 +146,31 @@ class HyperliquidSettings(BaseSettings):
         validation_alias="STRATEGY_MIN_TRADES",
     )
 
+    # --- Correlation-trap guard. When many distinct symbols move the same
+    # direction inside a short window the move is market beta, not a per-symbol
+    # edge; the engine skips the signal to avoid chasing a synchronized move. ---
+    correlation_guard_enabled: bool = Field(
+        default=True, validation_alias="CORRELATION_GUARD_ENABLED"
+    )
+    correlation_window_seconds: int = Field(
+        default=120, gt=0, validation_alias="CORRELATION_WINDOW_SECONDS"
+    )
+    correlation_max_same_side: int = Field(
+        default=4, gt=0, validation_alias="CORRELATION_MAX_SAME_SIDE"
+    )
+
     # --- Execution upgrades (PR5). Opt-in; defaults preserve legacy behavior. ---
     maker_entry_enabled: bool = Field(default=False, validation_alias="MAKER_ENTRY_ENABLED")
+    # Exchange fees in basis points, mirroring ``backtest.simulator.SimConfig`` so
+    # live journal PnL and backtest PnL are directly comparable. Entries are maker
+    # only when ``maker_entry_enabled`` (Alo/post-only); exits are always IOC
+    # reduce-only, i.e. taker. Override per your Hyperliquid VIP tier.
+    maker_fee_bps: Decimal = Field(
+        default=Decimal("1.5"), ge=Decimal("0"), validation_alias="MAKER_FEE_BPS"
+    )
+    taker_fee_bps: Decimal = Field(
+        default=Decimal("4.5"), ge=Decimal("0"), validation_alias="TAKER_FEE_BPS"
+    )
     confidence_sizing_enabled: bool = Field(
         default=False, validation_alias="CONFIDENCE_SIZING_ENABLED"
     )
@@ -153,28 +213,62 @@ class HyperliquidSettings(BaseSettings):
         default=Decimal("50"), gt=Decimal("0"), validation_alias="DVSLA_VOLUME_BAR_THRESHOLD"
     )
     # Per-symbol volume-bar size thresholds. Calibrated from recorded throughput
-    # so every coin closes ~2 bars/min (raw traded size differs by >1000x across
-    # the watchlist, so a single global threshold is meaningless). Override via
-    # the DVSLA_SYMBOL_THRESHOLDS env var as a JSON object, e.g. {"BTC":"40"}.
+    # (events-2026-06-16) so every coin closes ~2 bars/min (raw traded size
+    # differs by >1000x across the watchlist, so a single global threshold is
+    # meaningless and the tiny fallback caused thousands of micro-bars/sec).
+    # Override via the DVSLA_SYMBOL_THRESHOLDS env var as a JSON object,
+    # e.g. {"BTC":"40"}. Re-sweep periodically as throughput drifts.
     dvsla_symbol_thresholds: dict[str, Decimal] = Field(
         default_factory=lambda: {
-            "DOGE": Decimal("83000"),
-            "NEAR": Decimal("33000"),
-            "SUI": Decimal("12000"),
-            "SEI": Decimal("9500"),
-            "SOL": Decimal("2200"),
-            "APT": Decimal("2100"),
-            "LINK": Decimal("370"),
-            "INJ": Decimal("350"),
-            "AVAX": Decimal("310"),
-            "ETH": Decimal("270"),
-            "BTC": Decimal("37"),
+            "WLD": Decimal("69000"),
+            "SEI": Decimal("36000"),
+            "XRP": Decimal("25000"),
+            "ADA": Decimal("13000"),
+            "DOGE": Decimal("9400"),
+            "NEAR": Decimal("4500"),
+            "SUI": Decimal("2900"),
+            "ARB": Decimal("2800"),
+            "FET": Decimal("1800"),
+            "TIA": Decimal("1600"),
+            "OP": Decimal("1400"),
+            "APT": Decimal("810"),
+            "ETH": Decimal("400"),   # 640→400: warmup ~4sa→~2.5sa
+            "ATOM": Decimal("420"),
+            "SOL": Decimal("370"),
+            "FIL": Decimal("300"),
+            "INJ": Decimal("220"),
+            "LINK": Decimal("150"),
+            "AVAX": Decimal("130"),
+            "DOT": Decimal("93"),
+            "LTC": Decimal("11"),
+            "BTC": Decimal("8"),
+            "BCH": Decimal("3"),
+            "BNB": Decimal("2"),
         },
         validation_alias="DVSLA_SYMBOL_THRESHOLDS",
     )
     dvsla_ret_z_window: int = Field(default=50, gt=1, validation_alias="DVSLA_RET_Z_WINDOW")
     dvsla_ret_z_entry: Decimal = Field(
         default=Decimal("3.0"), gt=Decimal("0"), validation_alias="DVSLA_RET_Z_ENTRY"
+    )
+    # Minimum absolute bar return (fraction) for a bar to qualify as a return
+    # shock. Guards against variance-collapse blow-ups: a near-flat window can
+    # drive the z-score to absurd values, so an extreme z alone is not enough —
+    # the move itself must be at least this big (default 0.15%).
+    dvsla_ret_min_abs_pct: Decimal = Field(
+        default=Decimal("0.0015"), ge=Decimal("0"), validation_alias="DVSLA_RET_MIN_ABS_PCT"
+    )
+    # Hard cap on |ret_z| fed to the signal (collapsed-variance windows can
+    # otherwise yield z-scores in the millions).
+    dvsla_ret_z_clamp: Decimal = Field(
+        default=Decimal("25"), gt=Decimal("0"), validation_alias="DVSLA_RET_Z_CLAMP"
+    )
+    # Reject entries whose |ret_z| is at/above this level. A z-score near the
+    # clamp ceiling is not a real cascade but a variance-collapse or post-
+    # reconnect burst artefact (the single largest loser in the invert-era
+    # dry-run had ret_z=25.00). 0 disables the filter. Keep below ret_z_clamp.
+    dvsla_ret_z_reject: Decimal = Field(
+        default=Decimal("0"), ge=Decimal("0"), validation_alias="DVSLA_RET_Z_REJECT"
     )
     dvsla_flow_window: int = Field(default=200, gt=0, validation_alias="DVSLA_FLOW_WINDOW")
     dvsla_flow_imbalance_min: Decimal = Field(
@@ -186,6 +280,13 @@ class HyperliquidSettings(BaseSettings):
     dvsla_oi_z_window: int = Field(default=50, gt=1, validation_alias="DVSLA_OI_Z_WINDOW")
     dvsla_oi_z_drop: Decimal = Field(
         default=Decimal("-1.0"), lt=Decimal("0"), validation_alias="DVSLA_OI_Z_DROP"
+    )
+    # When fading (invert=False), a strongly *positive* OI z-score means open
+    # interest is expanding on the move — fresh directional money, not a
+    # liquidation cascade. Fading that is catching a knife against a real trend,
+    # so veto the signal when oi_z >= |oi_z_drop| (only applies in fade mode).
+    dvsla_fade_oi_z_veto: bool = Field(
+        default=True, validation_alias="DVSLA_FADE_OI_Z_VETO"
     )
     dvsla_hurst_window: int = Field(default=64, gt=16, validation_alias="DVSLA_HURST_WINDOW")
     dvsla_hurst_max: Decimal = Field(
@@ -211,7 +312,7 @@ class HyperliquidSettings(BaseSettings):
             return _parse_symbols(value)
         raise TypeError("BOT_SYMBOLS must be a comma-separated string")
 
-    @field_validator("testnet", "bot_dry_run", "telegram_poll_enabled", "record_events", "maker_entry_enabled", "confidence_sizing_enabled", "atr_stop_enabled", "reversion_tp_enabled", "dvsla_invert", mode="before")
+    @field_validator("testnet", "bot_dry_run", "telegram_poll_enabled", "record_events", "maker_entry_enabled", "confidence_sizing_enabled", "atr_stop_enabled", "reversion_tp_enabled", "dvsla_invert", "dvsla_fade_oi_z_veto", "correlation_guard_enabled", mode="before")
     @classmethod
     def parse_bool(cls, value: object) -> bool:
         if isinstance(value, bool):
