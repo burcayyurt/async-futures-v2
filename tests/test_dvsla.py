@@ -144,6 +144,51 @@ def _down_cascade_events(coin: str, last_close: float, step: int) -> list[Market
     return events
 
 
+def _osc_warmup(
+    coin: str, amp: float, *, step: int = 0, close: float = 100.0, n: int = 22
+) -> tuple[list[MarketEvent], float, int]:
+    """Oscillating (mean-reverting) warmup with a tunable return amplitude.
+
+    A small ``amp`` collapses the return variance, so a later move can produce a
+    huge z-score even though the move itself is tiny — exactly the variance-
+    collapse footprint the robustness guards must neutralize.
+    """
+
+    events: list[MarketEvent] = []
+    oi = 100_000.0
+    sides = ("B", "A", "B")
+    for i in range(n):
+        open_px = close
+        ret = amp if i % 2 == 0 else -amp
+        close = open_px * (1.0 + ret)
+        mid = (open_px + close) / 2.0
+        events.append(_trade(coin, open_px, 1, sides[0], step))
+        step += 1
+        events.append(_trade(coin, mid, 1, sides[1], step))
+        step += 1
+        events.append(_trade(coin, close, 1, sides[2], step))
+        step += 1
+        oi += 10.0 if i % 2 == 0 else -10.0
+        events.append(_ctx(coin, close, oi, close, step))
+        step += 1
+    return events, close, step
+
+
+def _sell_bar(coin: str, last_close: float, drop_frac: float, step: int) -> list[MarketEvent]:
+    """A single sell-driven down bar of size ``drop_frac`` (fraction)."""
+
+    events: list[MarketEvent] = []
+    events.append(_ctx(coin, last_close, 99_000.0, last_close, step))
+    step += 1
+    open_px = last_close
+    floor_px = last_close * (1.0 - drop_frac)
+    mid_px = (open_px + floor_px) / 2.0
+    for px in (open_px, mid_px, floor_px):
+        events.append(_trade(coin, px, 1, "A", step))
+        step += 1
+    return events
+
+
 # --------------------------------------------------------------------- units
 
 
@@ -268,6 +313,47 @@ async def test_cooldown_blocks_second_cascade():
     assert second_signals == []
 
 
+async def test_min_abs_return_filters_micro_move():
+    # A sub-threshold move (-0.1% < 0.15%) against a collapsed-variance window
+    # produces an extreme z-score but is NOT a real cascade -> must be skipped.
+    coin = "ETH"
+    strat = DvslaStrategy(_fast_params(ret_min_abs_pct=Decimal("0.0015")))
+    warmup, last_close, step = _osc_warmup(coin, 0.0002)
+    micro = _sell_bar(coin, last_close, 0.001, step)
+
+    await _feed(strat, warmup)
+    assert await _feed(strat, micro) == []
+
+
+async def test_min_abs_return_allows_real_move():
+    # The same setup but with a real -0.3% move clears the floor and fires.
+    coin = "ETH"
+    strat = DvslaStrategy(_fast_params(ret_min_abs_pct=Decimal("0.0015")))
+    warmup, last_close, step = _osc_warmup(coin, 0.0002)
+    real = _sell_bar(coin, last_close, 0.003, step)
+
+    await _feed(strat, warmup)
+    signals = await _feed(strat, real)
+    assert len(signals) == 1
+    assert signals[0].side == SignalSide.LONG
+
+
+async def test_ret_z_is_clamped_to_the_configured_cap():
+    # Collapsed variance + a >0.15% move yields a raw z far beyond the cap; the
+    # signal must carry the clamped value (±25), never an astronomical z-score.
+    coin = "ETH"
+    strat = DvslaStrategy(
+        _fast_params(ret_z_clamp=Decimal("25"), ret_min_abs_pct=Decimal("0.0015"))
+    )
+    warmup, last_close, step = _osc_warmup(coin, 0.0002)
+    shock = _sell_bar(coin, last_close, 0.006, step)
+
+    await _feed(strat, warmup)
+    signals = await _feed(strat, shock)
+    assert len(signals) == 1
+    assert "ret_z=-25.00" in signals[0].reason
+
+
 async def test_oi_collapse_raises_confidence_but_is_not_a_gate():
     # OI is a confidence weight, not a hard veto: a cascade with steady OI still
     # fires, but with lower confidence than the same cascade with an OI collapse.
@@ -313,6 +399,8 @@ def test_dvsla_params_from_settings_maps_env_fields():
         update={
             "dvsla_volume_bar_threshold": Decimal("123"),
             "dvsla_ret_z_entry": Decimal("2.5"),
+            "dvsla_ret_min_abs_pct": Decimal("0.002"),
+            "dvsla_ret_z_clamp": Decimal("30"),
             "dvsla_flow_imbalance_min": Decimal("0.6"),
             "dvsla_oi_z_drop": Decimal("-1.8"),
             "dvsla_hurst_max": Decimal("0.4"),
@@ -325,6 +413,8 @@ def test_dvsla_params_from_settings_maps_env_fields():
     assert params.invert is True
     assert params.volume_bar_threshold == Decimal("123")
     assert params.ret_z_entry == Decimal("2.5")
+    assert params.ret_min_abs_pct == Decimal("0.002")
+    assert params.ret_z_clamp == Decimal("30")
     assert params.flow_imbalance_min == Decimal("0.6")
     assert params.oi_z_drop == Decimal("-1.8")
     assert params.hurst_max == Decimal("0.4")
@@ -336,6 +426,26 @@ def test_default_strategy_engine_is_dvsla():
     from src.core.config import HyperliquidSettings
 
     assert HyperliquidSettings.from_env().strategy_engine == "dvsla"
+
+
+def test_symbol_thresholds_calibrated_without_dead_feeds():
+    from src.core.config import HyperliquidSettings
+
+    settings = HyperliquidSettings.from_env()
+    thresholds = settings.dvsla_symbol_thresholds
+
+    # Dead feeds (renamed to POL/RENDER on Hyperliquid) must be gone.
+    assert "MATIC" not in thresholds
+    assert "RNDR" not in thresholds
+    assert "MATIC" not in settings.symbols
+    assert "RNDR" not in settings.symbols
+
+    # Every watched symbol has a calibrated threshold (no silent tiny fallback
+    # that would spawn thousands of micro-bars/sec).
+    for symbol in settings.symbols:
+        assert symbol in thresholds, f"{symbol} missing a calibrated threshold"
+    # Sanity: the worst offender from the incident is now sized sanely.
+    assert thresholds["WLD"] >= Decimal("1000")
 
 
 async def test_decision_summary_reports_idle_warmup_and_active():

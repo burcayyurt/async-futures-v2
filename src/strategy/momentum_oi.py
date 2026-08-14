@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import AssetCtxPayload, EventKind, MarketEvent, TradePayload
+from src.strategy.market_breadth import DOWN, UP, MarketBreadthTracker
 from src.strategy.signals import SignalSide, TradeSignal
 
 logger = logging.getLogger(__name__)
@@ -141,14 +142,31 @@ class MomentumOIStrategy:
         settings: HyperliquidSettings,
         params: StrategyParams | None = None,
         on_signal: Callable[[TradeSignal], None] | None = None,
+        breadth: MarketBreadthTracker | None = None,
     ) -> None:
         self.settings = settings
         self.params = params or StrategyParams.from_settings(settings)
         self._on_signal = on_signal
+        self._breadth = breadth
         self._coins: dict[str, _CoinState] = {}
         self._regime = _RegimeTracker(self.params)
         self._last_logged_regime: MarketRegime | None = None
         self._last_decision_watch: dict[str, datetime] = {}
+
+    @staticmethod
+    def _move_direction(side: SignalSide) -> str:
+        return UP if side == SignalSide.LONG else DOWN
+
+    def _breadth_record(self, coin: str, side: SignalSide, now: datetime) -> None:
+        if self._breadth is not None:
+            self._breadth.record(coin, self._move_direction(side), now)
+
+    def _breadth_blocks(self, coin: str, side: SignalSide, now: datetime) -> bool:
+        if self._breadth is None:
+            return False
+        return self._breadth.is_synchronized(
+            self._move_direction(side), now, exclude=coin
+        )
 
     def decision_summary(self, watchlist: tuple[str, ...], *, now: datetime | None = None) -> str:
         ts = now or self._utc_now()
@@ -266,6 +284,9 @@ class MomentumOIStrategy:
                 candidate.side.value.upper(),
                 candidate.delta_pct,
             )
+        # Count the detection toward market breadth even before OI confirms, so a
+        # synchronized wave of breakouts is visible by the time one confirms.
+        self._breadth_record(candidate.coin, candidate.side, candidate.detected_at)
         state.pending_breakout = candidate
 
     def _publish_signal(self, signal: TradeSignal, oi_change: Decimal) -> TradeSignal:
@@ -503,6 +524,15 @@ class MomentumOIStrategy:
                     )
                     return None
 
+                self._breadth_record(coin, candidate.side, now)
+                if self._breadth_blocks(coin, candidate.side, now):
+                    self._log_decision_watch(
+                        coin,
+                        now,
+                        f"{candidate.side.value} blocked by market breadth (correlated move)",
+                    )
+                    return None
+
                 return self._publish_signal(self._build_signal(candidate, oi_change, now), oi_change)
 
             self._maybe_log_decision_watch(coin, state, now)
@@ -520,6 +550,15 @@ class MomentumOIStrategy:
             oi_change = self._confirm_oi(state, candidate)
             if oi_change is None:
                 self._arm_pending_breakout(state, candidate)
+                return None
+
+            self._breadth_record(coin, candidate.side, now)
+            if self._breadth_blocks(coin, candidate.side, now):
+                self._log_decision_watch(
+                    coin,
+                    now,
+                    f"{candidate.side.value} blocked by market breadth (correlated move)",
+                )
                 return None
 
             return self._publish_signal(self._build_signal(candidate, oi_change, now), oi_change)
@@ -541,6 +580,15 @@ class MomentumOIStrategy:
             oi_change = self._confirm_oi(state, candidate)
             if oi_change is None:
                 self._arm_pending_breakout(state, candidate)
+                return None
+
+            self._breadth_record(coin, candidate.side, now)
+            if self._breadth_blocks(coin, candidate.side, now):
+                self._log_decision_watch(
+                    coin,
+                    now,
+                    f"{candidate.side.value} blocked by market breadth (correlated move)",
+                )
                 return None
 
             return self._publish_signal(self._build_signal(candidate, oi_change, now), oi_change)

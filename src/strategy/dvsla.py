@@ -60,6 +60,7 @@ from src.strategy.microstructure import (
     classify_hurst,
     hurst_rs,
 )
+from src.strategy.market_breadth import DOWN, UP, MarketBreadthTracker
 from src.strategy.microstructure.hurst import HurstRegime
 from src.strategy.signals import SignalSide, TradeSignal
 
@@ -84,6 +85,18 @@ class DvslaParams(BaseModel):
     # Return-shock detection.
     ret_z_window: int = Field(default=50, gt=1)
     ret_z_entry: Decimal = Field(default=Decimal("3.0"), gt=Decimal("0"))
+    # Minimum absolute bar return (fraction) for a bar to count as a shock. A
+    # near-flat window collapses the return variance, which can drive the
+    # z-score to absurd values; an extreme z alone is therefore not enough — the
+    # move itself must be at least this large (default 0.15%).
+    ret_min_abs_pct: Decimal = Field(default=Decimal("0.0015"), ge=Decimal("0"))
+    # Hard cap on |ret_z| fed downstream (collapsed-variance windows otherwise
+    # yield z-scores in the millions).
+    ret_z_clamp: Decimal = Field(default=Decimal("25"), gt=Decimal("0"))
+    # Reject entries whose |ret_z| is at/above this level: a z near the clamp
+    # ceiling is a variance-collapse / post-reconnect burst artefact, not a real
+    # cascade. 0 disables. Keep below ``ret_z_clamp``.
+    ret_z_reject: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
 
     # One-sided flow confirmation.
     flow_window: int = Field(default=200, gt=0)
@@ -92,6 +105,9 @@ class DvslaParams(BaseModel):
     # OI-collapse confirmation (z-score of OI change; cascade => sharply negative).
     oi_z_window: int = Field(default=50, gt=1)
     oi_z_drop: Decimal = Field(default=Decimal("-1.0"), lt=Decimal("0"))
+    # In fade mode, veto signals when OI is strongly *expanding* (oi_z positive):
+    # fresh directional money, not a liquidation cascade — fading it is a knife.
+    fade_oi_z_veto: bool = Field(default=True)
 
     # Hurst regime gate (computed on bar returns; H < hurst_max => mean-reverting).
     hurst_window: int = Field(default=64, gt=16)
@@ -121,10 +137,14 @@ class DvslaParams(BaseModel):
             symbol_thresholds=dict(settings.dvsla_symbol_thresholds),
             ret_z_window=settings.dvsla_ret_z_window,
             ret_z_entry=settings.dvsla_ret_z_entry,
+            ret_min_abs_pct=settings.dvsla_ret_min_abs_pct,
+            ret_z_clamp=settings.dvsla_ret_z_clamp,
+            ret_z_reject=settings.dvsla_ret_z_reject,
             flow_window=settings.dvsla_flow_window,
             flow_imbalance_min=settings.dvsla_flow_imbalance_min,
             oi_z_window=settings.dvsla_oi_z_window,
             oi_z_drop=settings.dvsla_oi_z_drop,
+            fade_oi_z_veto=settings.dvsla_fade_oi_z_veto,
             hurst_window=settings.dvsla_hurst_window,
             hurst_max=settings.dvsla_hurst_max,
             warmup_bars=settings.dvsla_warmup_bars,
@@ -166,9 +186,11 @@ class DvslaStrategy:
         self,
         params: DvslaParams | None = None,
         on_signal: Callable[[TradeSignal], None] | None = None,
+        breadth: MarketBreadthTracker | None = None,
     ) -> None:
         self.params = params or DvslaParams()
         self._on_signal = on_signal
+        self._breadth = breadth
         self._symbols: dict[str, _SymbolState] = {}
 
     # ------------------------------------------------------------------ feed
@@ -263,6 +285,10 @@ class DvslaStrategy:
         # Score this bar's return against the window *before* incorporating it,
         # then record it — same discipline as the OI z-score tracker.
         ret_z = state.returns.z_score(ret) if state.returns.count >= 2 else 0.0
+        # Clamp pathological z-scores: a near-flat window collapses the variance
+        # and can drive |z| into the millions, making the entry gate meaningless.
+        clamp = float(self.params.ret_z_clamp)
+        ret_z = max(-clamp, min(clamp, ret_z))
         state.returns.update(ret)
         # Hurst is measured on bar *returns*, not price levels: R/S on an
         # integrated (price) series is persistent by construction (H~0.9) and
@@ -275,17 +301,71 @@ class DvslaStrategy:
         if not self._cooldown_elapsed(state):
             return None
 
+        # A genuine cascade must be a real move, not just a statistical outlier
+        # against a collapsed-variance window.
+        if abs(ret) < float(self.params.ret_min_abs_pct):
+            return None
+
+        # Reject clamp-ceiling z-scores: these are variance-collapse or post-
+        # reconnect burst artefacts rather than real cascades, and were the sole
+        # large loser in the invert-era dry-run.
+        reject = float(self.params.ret_z_reject)
+        if reject > 0 and abs(ret_z) >= reject:
+            logger.info(
+                "DVSLA skip %s: ret_z=%.2f at/above reject threshold %.2f (artefact)",
+                coin,
+                ret_z,
+                reject,
+            )
+            return None
+
         direction = self._classify_cascade(ret_z)
         if direction is None:
             return None
         if not self._flow_confirms(state, direction):
             return None
 
+        # Fade guard: a strongly *positive* OI z-score means open interest is
+        # expanding on the move (fresh directional money), not a liquidation
+        # cascade. Fading that is catching a knife against a real trend, so veto
+        # it. Only in fade mode — in momentum mode (invert) OI expansion actually
+        # supports the continuation, so it is not a veto there.
+        if (
+            self.params.fade_oi_z_veto
+            and not self.params.invert
+            and state.last_oi_z >= abs(float(self.params.oi_z_drop))
+        ):
+            logger.info(
+                "DVSLA skip %s: OI expanding (oi_z=%.2f) — trend, not cascade (fade veto)",
+                coin,
+                state.last_oi_z,
+            )
+            return None
+
+        # Record the cascade's *move* direction for the correlation guard. A
+        # cascade is detected here regardless of the eventual trade side (fade or
+        # momentum), so breadth reflects the underlying market move.
+        move = UP if direction is CascadeDirection.UP else DOWN
+        if self._breadth is not None:
+            self._breadth.record(coin, move, now)
+
         # OI collapse is no longer a hard veto: the Hyperliquid OI feed is too
         # sparse/stale to reliably confirm cascades at bar-close moments. It is
         # folded into the confidence score instead (see ``_confidence``).
         hurst, regime = self._regime(state)
         if regime is not HurstRegime.MEAN_REVERTING:
+            return None
+
+        # Correlation trap: if the broader market is cascading the same way, this
+        # is beta, not a per-symbol edge — skip rather than trade the wave.
+        if self._breadth is not None and self._breadth.is_synchronized(
+            move, now, exclude=coin
+        ):
+            logger.info(
+                "DVSLA skip %s: correlated %s move across market (breadth guard)",
+                coin,
+                move,
+            )
             return None
 
         divergence_pct = self._divergence_pct(state)
