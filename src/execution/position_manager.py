@@ -11,6 +11,7 @@ from src.core.config import HyperliquidSettings
 from src.core.open_position_store import OpenPositionStore
 from src.core.telegram import TelegramNotifier
 from src.core.trade_journal import TradeJournal, calc_roe_pct
+from src.exchange.hyperliquid_rest import ExchangePosition
 from src.exchange.hyperliquid_ws import AssetCtxPayload, EventKind, MarketEvent
 from src.risk.kill_switch import KillSwitch
 from src.strategy.microstructure import RollingStats
@@ -21,8 +22,19 @@ logger = logging.getLogger(__name__)
 FEE_BUFFER_PCT = Decimal("0.001")
 INITIAL_STOP_PCT = Decimal("0.02")
 PEAK_PERSIST_DEBOUNCE_SECONDS = 5.0
+# Relative size difference below which disk and exchange are treated as agreeing.
+SIZE_RECONCILE_TOLERANCE = Decimal("0.001")
 
 ExitHandler = Callable[["ManagedPosition", str], Awaitable[None]]
+ExchangePositionFetcher = Callable[[], Awaitable[dict[str, ExchangePosition]]]
+
+
+class PositionReconciliationError(RuntimeError):
+    """Raised when live position state cannot be established at startup.
+
+    Trading on an unknown position set is how a restart turns into a doubled or
+    unhedged position, so the bot refuses to start rather than guess.
+    """
 
 
 class _MarkTracker:
@@ -48,6 +60,16 @@ class _MarkTracker:
         if self._prev is not None and self._prev > 0:
             self._abs_returns.update(abs(float((mark_px - self._prev) / self._prev)))
         self._prev = mark_px
+
+    def resync(self, mark_px: Decimal) -> None:
+        """Re-anchor the price after a feed gap without recording the jump.
+
+        The return across a blackout spans the whole gap and would otherwise
+        blow up the ATR proxy; this resets the reference so the next tick yields
+        a clean single-tick return.
+        """
+        if mark_px > 0:
+            self._prev = mark_px
 
     @property
     def reversion_target(self) -> Decimal | None:
@@ -85,17 +107,20 @@ class PositionManager:
         telegram: TelegramNotifier | None = None,
         trade_journal: TradeJournal | None = None,
         open_position_store: OpenPositionStore | None = None,
+        exchange_positions: ExchangePositionFetcher | None = None,
     ) -> None:
         self.settings = settings
         self.kill_switch = kill_switch
         self._telegram = telegram
         self._journal = trade_journal
         self._open_store = open_position_store
+        self._exchange_positions = exchange_positions
         self._positions: dict[str, ManagedPosition] = {}
         self._exit_handler: ExitHandler | None = None
         self._panic_in_progress = False
         self._last_peak_persist: dict[str, datetime] = {}
         self._mark_trackers: dict[str, _MarkTracker] = {}
+        self._last_mark_ts: dict[str, datetime] = {}
 
     @property
     def positions(self) -> dict[str, ManagedPosition]:
@@ -104,12 +129,35 @@ class PositionManager:
     def bind_exit_handler(self, handler: ExitHandler) -> None:
         self._exit_handler = handler
 
+    async def _fetch_exchange_positions(self) -> dict[str, ExchangePosition] | None:
+        """Exchange truth for reconciliation, or ``None`` when not applicable.
+
+        Dry-run has no wallet and no real positions, so the disk record is the
+        only truth there. In live mode a missing or failing fetcher is fatal:
+        starting blind risks re-opening a position that is already on.
+        """
+
+        if self.settings.bot_dry_run:
+            return None
+        if self._exchange_positions is None:
+            raise PositionReconciliationError(
+                "Live mode requires an exchange position fetcher; refusing to start "
+                "without reconciliation."
+            )
+        try:
+            return await self._exchange_positions()
+        except Exception as exc:  # noqa: BLE001 - re-raised as a fatal startup error
+            raise PositionReconciliationError(
+                f"Could not read positions from the exchange: {exc}"
+            ) from exc
+
     async def recover_positions(self) -> list[ManagedPosition]:
         if self._open_store is None:
             return []
 
+        exchange = await self._fetch_exchange_positions()
         saved = await self._open_store.load()
-        if not saved:
+        if not saved and not exchange:
             return []
 
         allowed = {symbol.strip().upper() for symbol in self.settings.symbols}
@@ -121,11 +169,17 @@ class PositionManager:
                 await self._open_store.remove(coin)
                 continue
 
-            if not self.settings.bot_dry_run:
-                logger.info(
-                    "Recovered position %s from disk; exchange reconciliation is Phase 2 for live mode",
-                    coin,
-                )
+            if exchange is not None:
+                live = exchange.get(coin)
+                if live is None:
+                    # Closed (or liquidated) while the bot was down. Keeping it
+                    # would leave a phantom the exit handler can never fill.
+                    logger.warning(
+                        "Dropping %s: on disk but not open at the exchange", coin
+                    )
+                    await self._open_store.remove(coin)
+                    continue
+                position = self._reconcile(coin, position, live)
 
             self._positions[coin] = position
             recovered.append(position)
@@ -138,7 +192,94 @@ class PositionManager:
                 position.stop_px,
             )
 
+        if exchange is not None:
+            recovered.extend(await self._adopt_orphans(exchange, saved, allowed))
+
         return recovered
+
+    def _reconcile(
+        self, coin: str, position: ManagedPosition, live: ExchangePosition
+    ) -> ManagedPosition:
+        """Return the disk position corrected against exchange truth."""
+
+        live_side = SignalSide.LONG if live.is_long else SignalSide.SHORT
+        if live_side != position.side:
+            logger.warning(
+                "Side mismatch for %s: disk=%s exchange=%s; trusting the exchange",
+                coin,
+                position.side.value,
+                live_side.value,
+            )
+            entry_px = live.entry_px or position.entry_px
+            return ManagedPosition(
+                coin=coin,
+                side=live_side,
+                entry_px=entry_px,
+                size=live.abs_size,
+                stop_px=self.compute_initial_stop(coin, entry_px, live_side),
+                peak_px=entry_px,
+                opened_at=position.opened_at,
+            )
+
+        if position.size > 0:
+            drift = abs(live.abs_size - position.size) / position.size
+            if drift > SIZE_RECONCILE_TOLERANCE:
+                logger.warning(
+                    "Size mismatch for %s: disk=%s exchange=%s; trusting the exchange",
+                    coin,
+                    position.size,
+                    live.abs_size,
+                )
+                position.size = live.abs_size
+        return position
+
+    async def _adopt_orphans(
+        self,
+        exchange: dict[str, ExchangePosition],
+        saved: dict[str, ManagedPosition],
+        allowed: set[str],
+    ) -> list[ManagedPosition]:
+        """Take over exchange positions the bot has no record of.
+
+        An unmanaged live position has no stop attached, so leaving it alone is
+        the worst option; adopting it at least puts it under stop management.
+        Symbols outside ``BOT_SYMBOLS`` are adopted too — the risk is real money
+        regardless of whether the bot would trade that symbol today.
+        """
+
+        adopted: list[ManagedPosition] = []
+        for coin, live in exchange.items():
+            if coin in saved or coin in self._positions:
+                continue
+            side = SignalSide.LONG if live.is_long else SignalSide.SHORT
+            entry_px = live.entry_px
+            if entry_px <= 0:
+                logger.error(
+                    "Orphan position %s has no usable entry price; leaving unmanaged", coin
+                )
+                continue
+            position = ManagedPosition(
+                coin=coin,
+                side=side,
+                entry_px=entry_px,
+                size=live.abs_size,
+                stop_px=self.compute_initial_stop(coin, entry_px, side),
+                peak_px=entry_px,
+            )
+            self._positions[coin] = position
+            adopted.append(position)
+            if self._open_store is not None:
+                await self._open_store.upsert(position)
+            logger.warning(
+                "Adopted untracked exchange position %s %s size=%s entry=%s stop=%s%s",
+                coin,
+                side.value,
+                position.size,
+                entry_px,
+                position.stop_px,
+                "" if coin in allowed else " (not in BOT_SYMBOLS)",
+            )
+        return adopted
 
     async def register_position(self, position: ManagedPosition) -> None:
         coin = position.coin.strip().upper()
@@ -283,6 +424,11 @@ class PositionManager:
             return None
 
         callback = self.settings.trailing_callback_pct
+        # A zero callback is "no trail", not "trail at the peak". Without this
+        # the trigger equals the peak itself and every tick that fails to set a
+        # new high closes the position.
+        if callback <= 0:
+            return None
         if position.side == SignalSide.LONG:
             trigger_px = position.peak_px * (Decimal("1") - callback)
             if mark_px <= trigger_px:
@@ -292,6 +438,33 @@ class PositionManager:
             if mark_px >= trigger_px:
                 return trigger_px
         return None
+
+    def _within_min_hold(self, position: ManagedPosition, now: datetime) -> bool:
+        """True if the position is younger than ``min_hold_seconds``.
+
+        Suppresses hard-stop exits in the first moments after entry to avoid
+        1-tick whipsaw stop-outs. The kill-switch panic path always overrides
+        this (it runs before any per-position logic in ``on_price_update``).
+        """
+        min_hold = float(self.settings.min_hold_seconds)
+        if min_hold <= 0:
+            return False
+        return (now - position.opened_at).total_seconds() < min_hold
+
+    def _exceeded_max_hold(self, position: ManagedPosition, now: datetime) -> bool:
+        """True once the position has been open longer than ``max_hold_seconds``.
+
+        Evaluated after the price-based exits so a stop or trail that is already
+        due still wins; the horizon exit only handles positions nothing else
+        closed.
+        """
+        max_hold = float(self.settings.max_hold_seconds)
+        if max_hold <= 0:
+            return False
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return (now - opened_at).total_seconds() >= max_hold
 
     def _hit_hard_stop(self, position: ManagedPosition, mark_px: Decimal) -> bool:
         if position.side == SignalSide.LONG:
@@ -341,11 +514,23 @@ class PositionManager:
         try:
             positions = list(self._positions.values())
             logger.critical("Panic closing %d open position(s)", len(positions))
+            failed: list[str] = []
             for position in positions:
                 exit_px = self.kill_switch.mark_prices.get(position.coin)
                 if exit_px is None:
                     exit_px = position.peak_px or position.entry_px
-                await self._request_exit(position, "kill_switch", exit_px=exit_px)
+                try:
+                    await self._request_exit(position, "kill_switch", exit_px=exit_px)
+                except Exception:  # noqa: BLE001 - one bad symbol must not strand the rest
+                    # A panic close is the worst moment to abort a batch: the
+                    # symbol that fails is often the one that is moving. Keep
+                    # going and report, so the remaining positions still close.
+                    failed.append(position.coin)
+                    logger.exception("Panic close failed for %s", position.coin)
+            if failed:
+                logger.critical(
+                    "Panic close incomplete; still open: %s", ", ".join(sorted(failed))
+                )
         finally:
             self._panic_in_progress = False
 
@@ -355,6 +540,31 @@ class PositionManager:
             return
 
         normalized = coin.strip().upper()
+        now = datetime.now(timezone.utc)
+
+        # Detect a feed blackout (e.g. an upstream 502): a large gap since this
+        # coin's previous mark. The first tick after a blackout is discontinuous,
+        # so we re-anchor the trackers and skip all stop/exit decisions for that
+        # one tick — otherwise a stop could fire at a gapped price. The next
+        # fresh tick resumes normal management.
+        last_ts = self._last_mark_ts.get(normalized)
+        gap_limit = float(self.settings.mark_staleness_gap_seconds)
+        stale_gap = (
+            gap_limit > 0
+            and last_ts is not None
+            and (now - last_ts).total_seconds() > gap_limit
+        )
+        self._last_mark_ts[normalized] = now
+
+        if stale_gap:
+            self._tracker(normalized).resync(mark_px)
+            logger.warning(
+                "Stale mark gap for %s (>%.1fs); skipping stop checks for one tick",
+                normalized,
+                gap_limit,
+            )
+            return
+
         # Keep the volatility / reversion trackers warm even before a position
         # exists, so ATR-stop and reversion-TP are ready the moment one opens.
         self._tracker(normalized).update(mark_px)
@@ -366,13 +576,18 @@ class PositionManager:
         previous_peak = position.peak_px
         self._update_peak(position, mark_px)
         if position.peak_px != previous_peak:
-            await self._maybe_persist_position(position, datetime.now(timezone.utc))
+            await self._maybe_persist_position(position, now)
 
         await self.maybe_move_to_break_even(position, mark_px)
 
         if self._hit_hard_stop(position, mark_px):
-            await self._request_exit(position, "stop_loss", exit_px=mark_px)
-            return
+            if self._within_min_hold(position, now):
+                logger.debug(
+                    "Hard stop for %s suppressed: within min-hold window", normalized
+                )
+            else:
+                await self._request_exit(position, "stop_loss", exit_px=mark_px)
+                return
 
         reversion_px = self._reversion_take_profit(position, mark_px)
         if reversion_px is not None:
@@ -382,6 +597,10 @@ class PositionManager:
         trail_trigger = await self.maybe_trail_stop(position, mark_px)
         if trail_trigger is not None:
             await self._request_exit(position, "trailing_stop", exit_px=mark_px)
+            return
+
+        if self._exceeded_max_hold(position, now):
+            await self._request_exit(position, "time_stop", exit_px=mark_px)
 
     async def consume_market_events(self, queue: asyncio.Queue[MarketEvent]) -> None:
         while True:

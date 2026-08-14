@@ -59,6 +59,65 @@ class SignedPayload:
     signature: dict[str, Any]
 
 
+def order_rejection(result: dict[str, Any]) -> str | None:
+    """Return the rejection reason for an order response, or ``None`` if accepted.
+
+    Hyperliquid signals business-level failures inside an HTTP 200 body, so
+    ``raise_for_status`` never sees them. Two shapes matter::
+
+        {"status": "err", "response": "Insufficient margin"}
+        {"status": "ok", "response": {"data": {"statuses": [{"error": "..."}]}}}
+
+    The second is routine with post-only entries: an ``Alo`` order that would
+    cross is refused rather than filled. Treating that as success registers a
+    position that does not exist.
+
+    Anything unrecognised counts as a rejection. For an entry that means not
+    opening; for an exit it means keeping the position under management. Both
+    are the safe direction when the alternative is losing track of real money.
+    """
+
+    status = result.get("status")
+    if status == "dry_run":
+        return None
+    if status == "err":
+        return str(result.get("response", "exchange returned an error"))
+    if status != "ok":
+        return f"unrecognised order response status: {status!r}"
+
+    response = result.get("response")
+    if not isinstance(response, dict):
+        return f"unrecognised order response payload: {response!r}"
+    data = response.get("data")
+    if not isinstance(data, dict):
+        # Some acknowledgements carry no data block; treat as accepted.
+        return None
+    statuses = data.get("statuses")
+    if not isinstance(statuses, list) or not statuses:
+        return None
+    for entry in statuses:
+        if isinstance(entry, dict) and "error" in entry:
+            return str(entry["error"])
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePosition:
+    """A position as the exchange reports it — the source of truth on restart."""
+
+    coin: str
+    signed_size: Decimal
+    entry_px: Decimal
+
+    @property
+    def is_long(self) -> bool:
+        return self.signed_size > 0
+
+    @property
+    def abs_size(self) -> Decimal:
+        return abs(self.signed_size)
+
+
 class HyperliquidRestClient:
     """
     REST client for Hyperliquid /info and /exchange endpoints.
@@ -142,6 +201,38 @@ class HyperliquidRestClient:
         if not wallet:
             raise ValueError("WALLET_ADDRESS is required to read positions")
         return await self.post_info({"type": "clearinghouseState", "user": wallet})
+
+    async def get_open_positions(self) -> dict[str, ExchangePosition]:
+        """Return live positions keyed by coin, skipping fully-closed legs.
+
+        Hyperliquid reports size as ``szi``: signed, negative for shorts. A zero
+        ``szi`` means the leg is flat and is omitted rather than reported as a
+        position with no size.
+        """
+
+        state = await self.get_clearinghouse_state()
+        positions: dict[str, ExchangePosition] = {}
+        for entry in state.get("assetPositions") or []:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("position")
+            if not isinstance(raw, dict):
+                continue
+            coin = str(raw.get("coin", "")).strip().upper()
+            if not coin:
+                continue
+            try:
+                signed_size = Decimal(str(raw.get("szi", "0")))
+                entry_px = Decimal(str(raw.get("entryPx") or "0"))
+            except (ArithmeticError, ValueError):
+                logger.warning("Unparseable position payload for %s: %r", coin, raw)
+                continue
+            if signed_size == 0:
+                continue
+            positions[coin] = ExchangePosition(
+                coin=coin, signed_size=signed_size, entry_px=entry_px
+            )
+        return positions
 
     async def place_order(self, order: OrderRequest) -> dict[str, Any]:
         await self._require_initialized()

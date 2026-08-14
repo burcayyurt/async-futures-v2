@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -9,8 +9,13 @@ import pytest
 from src.core.config import HyperliquidSettings
 from src.core.open_position_store import OpenPositionStore
 from src.core.trade_journal import TradeJournal
+from src.exchange.hyperliquid_rest import ExchangePosition
 from src.execution.order_router import OrderRouter
-from src.execution.position_manager import ManagedPosition, PositionManager
+from src.execution.position_manager import (
+    ManagedPosition,
+    PositionManager,
+    PositionReconciliationError,
+)
 from src.risk.kill_switch import KillSwitch
 from src.risk.margin_manager import MarginManager, MarginSnapshot
 from src.strategy.momentum_oi import SignalSide, TradeSignal
@@ -169,6 +174,46 @@ async def test_panic_close_all_on_kill_switch(
 
 
 @pytest.mark.asyncio
+async def test_panic_close_continues_after_a_failing_symbol(
+    position_manager: PositionManager,
+    kill_switch: KillSwitch,
+) -> None:
+    """One symbol failing to close must not strand the others.
+
+    A panic close runs precisely when things are going wrong, so the symbol that
+    errors is often the one that is moving hardest.
+    """
+    attempted: list[str] = []
+
+    async def handler(position: ManagedPosition, reason: str) -> None:
+        attempted.append(position.coin)
+        if position.coin == "ETH":
+            raise ConnectionError("exchange rejected the close")
+        await position_manager.remove_position(position.coin)
+
+    position_manager.bind_exit_handler(handler)
+    for coin in ("BTC", "ETH", "SOL"):
+        await position_manager.register_position(
+            ManagedPosition(
+                coin=coin,
+                side=SignalSide.LONG,
+                entry_px=Decimal("100"),
+                size=Decimal("1"),
+                stop_px=Decimal("98"),
+                peak_px=Decimal("100"),
+            )
+        )
+
+    await kill_switch.trip("panic test")
+    await position_manager.on_price_update("BTC", Decimal("99"))
+
+    assert sorted(attempted) == ["BTC", "ETH", "SOL"]  # every symbol attempted
+    assert "BTC" not in position_manager.positions
+    assert "SOL" not in position_manager.positions
+    assert "ETH" in position_manager.positions  # the failure stays open, and visible
+
+
+@pytest.mark.asyncio
 async def test_short_trailing_exit(position_manager: PositionManager) -> None:
     exits: list[str] = []
 
@@ -282,6 +327,279 @@ async def test_recover_positions_filters_symbols_outside_watchlist(
 
 
 # --------------------------------------------------------------------------
+# Horizon (time) exit
+# --------------------------------------------------------------------------
+
+
+async def _pm_with_max_hold(
+    settings: HyperliquidSettings, seconds: str, *, trailing: str = "0"
+) -> tuple[PositionManager, list[str]]:
+    tuned = settings.model_copy(
+        update={
+            "max_hold_seconds": Decimal(seconds),
+            "trailing_callback_pct": Decimal(trailing),
+            "break_even_trigger_pct": Decimal("0"),
+        }
+    )
+    pm = PositionManager(tuned, KillSwitch(tuned))
+    reasons: list[str] = []
+
+    async def handler(position: ManagedPosition, reason: str) -> None:
+        reasons.append(reason)
+        await pm.remove_position(position.coin)
+
+    pm.bind_exit_handler(handler)
+    return pm, reasons
+
+
+def _aged_position(seconds_ago: int) -> ManagedPosition:
+    return ManagedPosition(
+        coin="BTC",
+        side=SignalSide.LONG,
+        entry_px=Decimal("100"),
+        size=Decimal("1"),
+        stop_px=Decimal("90"),
+        peak_px=Decimal("100"),
+        opened_at=datetime.now(timezone.utc) - timedelta(seconds=seconds_ago),
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_callback_disables_the_trail(settings: HyperliquidSettings) -> None:
+    """0 must mean "no trail", not "trail sitting exactly on the peak".
+
+    With the trigger equal to the peak, every tick that is not a new high closes
+    the position — which would silently wreck the horizon-exit configuration.
+    """
+    pm, reasons = await _pm_with_max_hold(settings, "0", trailing="0")
+    await pm.register_position(_aged_position(5))
+    await pm.on_price_update("BTC", Decimal("99.99"))  # below peak, not a new high
+    assert reasons == []
+    assert "BTC" in pm.positions
+
+
+@pytest.mark.asyncio
+async def test_max_hold_closes_a_stale_position(settings: HyperliquidSettings) -> None:
+    pm, reasons = await _pm_with_max_hold(settings, "60")
+    await pm.register_position(_aged_position(120))
+    await pm.on_price_update("BTC", Decimal("100.05"))
+    assert reasons == ["time_stop"]
+
+
+@pytest.mark.asyncio
+async def test_max_hold_leaves_a_fresh_position_open(settings: HyperliquidSettings) -> None:
+    pm, reasons = await _pm_with_max_hold(settings, "60")
+    await pm.register_position(_aged_position(5))
+    await pm.on_price_update("BTC", Decimal("100.05"))
+    assert reasons == []
+    assert "BTC" in pm.positions
+
+
+@pytest.mark.asyncio
+async def test_max_hold_disabled_by_default_keeps_position(
+    settings: HyperliquidSettings,
+) -> None:
+    """Zero must preserve today's behaviour, or enabling the code changes the run."""
+    pm, reasons = await _pm_with_max_hold(settings, "0")
+    await pm.register_position(_aged_position(100_000))
+    await pm.on_price_update("BTC", Decimal("100.05"))
+    assert reasons == []
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_beats_max_hold(settings: HyperliquidSettings) -> None:
+    """A position that is both stale and stopped out books the stop."""
+    pm, reasons = await _pm_with_max_hold(settings, "60")
+    await pm.register_position(_aged_position(120))
+    await pm.on_price_update("BTC", Decimal("89"))  # through the 90 stop
+    assert reasons == ["stop_loss"]
+
+
+@pytest.mark.asyncio
+async def test_trailing_beats_max_hold(settings: HyperliquidSettings) -> None:
+    """With both armed the price-based exit wins, matching the simulator."""
+    pm, reasons = await _pm_with_max_hold(settings, "60", trailing="0.01")
+    await pm.register_position(_aged_position(120))
+    await pm.on_price_update("BTC", Decimal("98"))  # 1% below the 100 peak
+    assert reasons == ["trailing_stop"]
+
+
+# --------------------------------------------------------------------------
+# Live startup reconciliation
+# --------------------------------------------------------------------------
+
+
+def _live(settings: HyperliquidSettings) -> HyperliquidSettings:
+    return settings.model_copy(update={"bot_dry_run": False})
+
+
+def _ex(coin: str, szi: str, entry: str = "100") -> ExchangePosition:
+    return ExchangePosition(
+        coin=coin, signed_size=Decimal(szi), entry_px=Decimal(entry)
+    )
+
+
+async def _store_with(tmp_path, settings: HyperliquidSettings, *positions) -> OpenPositionStore:
+    store_path = tmp_path / "open_positions.json"
+    store = OpenPositionStore(
+        settings.model_copy(update={"open_positions_path": str(store_path)}),
+        path=store_path,
+    )
+    for p in positions:
+        await store.upsert(p)
+    return store
+
+
+def _managed(coin: str = "BTC", side: SignalSide = SignalSide.LONG, size: str = "2") -> ManagedPosition:
+    return ManagedPosition(
+        coin=coin,
+        side=side,
+        entry_px=Decimal("100"),
+        size=Decimal(size),
+        stop_px=Decimal("98"),
+        peak_px=Decimal("100"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_skips_exchange_reconciliation(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """Dry-run has no real positions; the fetcher must not be consulted."""
+    store = await _store_with(tmp_path, settings, _managed())
+    fetcher = AsyncMock()
+    pm = PositionManager(
+        settings, kill_switch, open_position_store=store, exchange_positions=fetcher
+    )
+    recovered = await pm.recover_positions()
+    fetcher.assert_not_awaited()
+    assert [p.coin for p in recovered] == ["BTC"]
+
+
+@pytest.mark.asyncio
+async def test_live_without_fetcher_refuses_to_start(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    live = _live(settings)
+    store = await _store_with(tmp_path, live, _managed())
+    pm = PositionManager(live, kill_switch, open_position_store=store)
+    with pytest.raises(PositionReconciliationError):
+        await pm.recover_positions()
+
+
+@pytest.mark.asyncio
+async def test_live_fetch_failure_refuses_to_start(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """A failed read must not silently degrade into trading blind."""
+    live = _live(settings)
+    store = await _store_with(tmp_path, live, _managed())
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(side_effect=ConnectionError("boom")),
+    )
+    with pytest.raises(PositionReconciliationError):
+        await pm.recover_positions()
+
+
+@pytest.mark.asyncio
+async def test_disk_position_absent_from_exchange_is_dropped(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """Closed/liquidated while down — keeping it would leave a phantom."""
+    live = _live(settings)
+    store = await _store_with(tmp_path, live, _managed())
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(return_value={}),
+    )
+    assert await pm.recover_positions() == []
+    assert "BTC" not in pm.positions
+
+
+@pytest.mark.asyncio
+async def test_size_mismatch_trusts_the_exchange(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    live = _live(settings)
+    store = await _store_with(tmp_path, live, _managed(size="2"))
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(return_value={"BTC": _ex("BTC", "5")}),
+    )
+    recovered = await pm.recover_positions()
+    assert recovered[0].size == Decimal("5")
+
+
+@pytest.mark.asyncio
+async def test_side_mismatch_rebuilds_from_exchange(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """Disk says long, exchange says short: the exchange wins, stop recomputed."""
+    live = _live(settings)
+    store = await _store_with(tmp_path, live, _managed(side=SignalSide.LONG))
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(return_value={"BTC": _ex("BTC", "-3", "120")}),
+    )
+    pos = (await pm.recover_positions())[0]
+    assert pos.side == SignalSide.SHORT
+    assert pos.size == Decimal("3")
+    assert pos.entry_px == Decimal("120")
+    assert pos.stop_px > pos.entry_px  # short stop sits above entry
+
+
+@pytest.mark.asyncio
+async def test_untracked_exchange_position_is_adopted(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """An unmanaged live position has no stop; adopting beats ignoring."""
+    live = _live(settings)
+    store = await _store_with(tmp_path, live)
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(return_value={"SOL": _ex("SOL", "9", "50")}),
+    )
+    recovered = await pm.recover_positions()
+    assert [p.coin for p in recovered] == ["SOL"]
+    adopted = pm.positions["SOL"]
+    assert adopted.size == Decimal("9")
+    assert adopted.stop_px < adopted.entry_px  # long stop sits below entry
+    assert "SOL" in await store.load()  # persisted so a later restart sees it
+
+
+@pytest.mark.asyncio
+async def test_matching_position_keeps_disk_stop(
+    settings: HyperliquidSettings, kill_switch: KillSwitch, tmp_path
+) -> None:
+    """Agreement must not discard the trailing/break-even state on disk."""
+    live = _live(settings)
+    saved = _managed(size="2")
+    saved.stop_px = Decimal("99.5")
+    saved.break_even_armed = True
+    store = await _store_with(tmp_path, live, saved)
+    pm = PositionManager(
+        live,
+        kill_switch,
+        open_position_store=store,
+        exchange_positions=AsyncMock(return_value={"BTC": _ex("BTC", "2")}),
+    )
+    pos = (await pm.recover_positions())[0]
+    assert pos.stop_px == Decimal("99.5")
+    assert pos.break_even_armed is True
+
+
+# --------------------------------------------------------------------------
 # PR5 execution upgrades
 # --------------------------------------------------------------------------
 
@@ -302,6 +620,86 @@ def _build_router(settings: HyperliquidSettings) -> OrderRouter:
     )
     margin_manager.calculate_position_size = MagicMock(return_value=1.0)
     return OrderRouter(settings, rest, kill_switch, margin_manager, position_manager)
+
+
+_ALO_REJECTED = {
+    "status": "ok",
+    "response": {
+        "data": {
+            "statuses": [
+                {"error": "Order could not immediately match against any resting orders."}
+            ]
+        }
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_rejected_entry_does_not_register_a_position(
+    settings: HyperliquidSettings,
+) -> None:
+    """A refused post-only entry must not create a position that does not exist.
+
+    Hyperliquid returns this inside an HTTP 200, so nothing upstream raises. If
+    the position were registered the bot would manage a phantom and later send a
+    reduce-only close for it.
+    """
+    router = _build_router(settings)
+    router.rest.place_order = AsyncMock(return_value=_ALO_REJECTED)
+
+    result = await router.route_entry(_signal())
+
+    assert result is None
+    assert router.position_manager.positions == {}
+
+
+@pytest.mark.asyncio
+async def test_rejected_exit_keeps_the_position_under_management(
+    settings: HyperliquidSettings,
+) -> None:
+    """A failed close must not drop the record.
+
+    Forgetting it would leave a real position on the exchange with no stop
+    attached and nothing watching it.
+    """
+    router = _build_router(settings)
+    position = ManagedPosition(
+        coin="BTC",
+        side=SignalSide.LONG,
+        entry_px=Decimal("100"),
+        size=Decimal("1"),
+        stop_px=Decimal("98"),
+        peak_px=Decimal("100"),
+    )
+    await router.position_manager.register_position(position)
+    router.rest.place_order = AsyncMock(
+        return_value={"status": "err", "response": "Insufficient margin"}
+    )
+
+    await router.route_exit(position, "stop_loss")
+
+    assert "BTC" in router.position_manager.positions  # still managed, retries next tick
+
+
+@pytest.mark.asyncio
+async def test_accepted_exit_removes_the_position(settings: HyperliquidSettings) -> None:
+    router = _build_router(settings)
+    position = ManagedPosition(
+        coin="BTC",
+        side=SignalSide.LONG,
+        entry_px=Decimal("100"),
+        size=Decimal("1"),
+        stop_px=Decimal("98"),
+        peak_px=Decimal("100"),
+    )
+    await router.position_manager.register_position(position)
+    router.rest.place_order = AsyncMock(
+        return_value={"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1}}]}}}
+    )
+
+    await router.route_exit(position, "time_stop")
+
+    assert "BTC" not in router.position_manager.positions
 
 
 @pytest.mark.asyncio
