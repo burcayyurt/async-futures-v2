@@ -9,6 +9,7 @@ making look-ahead bias structurally impossible.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
@@ -21,6 +22,8 @@ from src.exchange.hyperliquid_ws import (
     MarketEvent,
     TradePayload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
@@ -62,15 +65,34 @@ def deserialize_event(line: str | dict[str, Any]) -> MarketEvent:
 
 
 def replay_file(path: Path | str) -> Iterator[MarketEvent]:
-    """Yield events from a single JSONL recording file in order."""
+    """Yield events from a single JSONL recording file in order.
+
+    Corrupt lines are skipped rather than fatal. A recording is an append-only
+    log written by a live process, so an unclean shutdown (crash, host reboot)
+    can leave a torn or NUL-padded line behind. Aborting a multi-million-event
+    replay over one bad line out of millions would make backtests hostage to
+    unrelated infrastructure failures.
+    """
 
     file_path = Path(path)
-    with file_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
+    skipped = 0
+    with file_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip().strip("\x00")
             if not line:
                 continue
-            yield deserialize_event(line)
+            try:
+                event = deserialize_event(line)
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                skipped += 1
+                if skipped <= 3:
+                    logger.warning(
+                        "Skipping malformed recording line %s in %s", line_no, file_path.name
+                    )
+                continue
+            yield event
+    if skipped:
+        logger.warning("Skipped %d malformed line(s) in %s", skipped, file_path.name)
 
 
 class EventReplayer:

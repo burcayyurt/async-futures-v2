@@ -50,11 +50,31 @@ class SimConfig:
     min_notional: Decimal = Decimal("100")
     max_notional: Decimal = Decimal("1000")
 
-    # Bracket exit, as fractions of entry price.
+    # Bracket exit, as fractions of entry price. ``take_profit_pct`` of 0 disables
+    # the fixed target (live runs with reversion-TP off and lets the trail work).
     take_profit_pct: Decimal = Decimal("0.006")
     stop_loss_pct: Decimal = Decimal("0.004")
     # Time stop: close after this many seconds if neither bracket hit. 0 = off.
     time_stop_seconds: Decimal = Decimal("300")
+
+    # --- Trailing / break-even, mirroring src.execution.position_manager so the
+    # sweep measures the exit layer the live bot actually runs. Both default to 0
+    # (off), which preserves the original pure-bracket behaviour. ---
+    # Exit once price retraces this fraction from the peak reached since entry.
+    trailing_callback_pct: Decimal = Decimal("0")
+    # Once the position gains this fraction, ratchet the stop to entry +/- fees.
+    break_even_trigger_pct: Decimal = Decimal("0")
+    # Cushion added to the break-even stop so it clears round-trip costs.
+    fee_buffer_pct: Decimal = Decimal("0.001")
+
+    # --- Maker-entry realism. Live places post-only (Alo) entries at the signal
+    # mark, which only fill if price comes back to the resting order. Assuming
+    # they always fill flatters momentum entries most, because there price is
+    # running away from the order by construction. Off by default (fill at the
+    # signal price, the original behaviour). ---
+    maker_entry_enabled: bool = False
+    # Give up on an unfilled resting order after this many seconds. 0 = never.
+    maker_fill_timeout_seconds: Decimal = Decimal("60")
 
     max_concurrent: int = 5
 
@@ -73,6 +93,10 @@ class OpenPosition:
     entry_fee: Decimal
     confidence: Decimal
     reason: str
+    # Best price seen since entry; seeded with the entry itself exactly as
+    # PositionManager.register_position does, so the trail is live from tick one.
+    peak_px: Decimal = Decimal("0")
+    break_even_armed: bool = False
 
 
 @dataclass(slots=True)
@@ -93,12 +117,27 @@ class ClosedTrade:
     confidence: Decimal
 
 
+@dataclass(slots=True)
+class PendingMakerOrder:
+    """A resting post-only entry waiting for price to come back to it."""
+
+    coin: str
+    side: SignalSide
+    limit_px: Decimal
+    placed_ts: datetime
+    confidence: Decimal
+    reason: str
+
+
 @dataclass
 class BacktestResult:
     trades: list[ClosedTrade] = field(default_factory=list)
     signals: int = 0
     skipped_signals: int = 0
     events_processed: int = 0
+    maker_orders_placed: int = 0
+    maker_orders_filled: int = 0
+    maker_orders_expired: int = 0
 
 
 class BacktestSimulator:
@@ -108,6 +147,7 @@ class BacktestSimulator:
         self._strategy = strategy
         self._cfg = config or SimConfig()
         self._open: dict[str, OpenPosition] = {}
+        self._pending: dict[str, PendingMakerOrder] = {}
         self._marks: dict[str, Decimal] = {}
         self._result = BacktestResult()
 
@@ -126,6 +166,7 @@ class BacktestSimulator:
                 # Evaluate exits BEFORE the strategy sees the event so a signal
                 # cannot close on its own entry print.
                 self._check_exits(event.coin, price, ts)
+                self._check_pending_fills(event.coin, price, ts)
 
             signal = await self._strategy.on_market_event(event)
             if signal is not None:
@@ -152,7 +193,11 @@ class BacktestSimulator:
 
     def _open_from_signal(self, signal: TradeSignal) -> None:
         coin = signal.symbol.strip().upper()
-        if coin in self._open or len(self._open) >= self._cfg.max_concurrent:
+        if (
+            coin in self._open
+            or coin in self._pending
+            or len(self._open) + len(self._pending) >= self._cfg.max_concurrent
+        ):
             self._result.skipped_signals += 1
             return
         entry_px = signal.entry_mark_price
@@ -161,15 +206,50 @@ class BacktestSimulator:
             return
 
         confidence = max(Decimal("0"), min(Decimal("1"), signal.confidence))
+
+        if self._cfg.maker_entry_enabled:
+            # Post-only: rest at the signal mark and wait for price to come back.
+            self._pending[coin] = PendingMakerOrder(
+                coin=coin,
+                side=signal.side,
+                limit_px=entry_px,
+                placed_ts=signal.timestamp,
+                confidence=confidence,
+                reason=signal.reason,
+            )
+            self._result.maker_orders_placed += 1
+            return
+
+        self._open_position(
+            coin, signal.side, entry_px, signal.timestamp, confidence, signal.reason
+        )
+
+    def _open_position(
+        self,
+        coin: str,
+        side: SignalSide,
+        entry_px: Decimal,
+        entry_ts: datetime,
+        confidence: Decimal,
+        reason: str,
+    ) -> None:
         notional = self._cfg.min_notional + (
             (self._cfg.max_notional - self._cfg.min_notional) * confidence
         )
         qty = notional / entry_px
-        entry_fee = notional * self._cfg.maker_fee_bps / _BPS
+        # A post-only entry earns the maker rate; an immediate fill crosses the
+        # spread and pays taker. Charging maker either way understates the cost
+        # of the non-maker path by 3bps a trade.
+        entry_rate = (
+            self._cfg.maker_fee_bps
+            if self._cfg.maker_entry_enabled
+            else self._cfg.taker_fee_bps
+        )
+        entry_fee = notional * entry_rate / _BPS
 
         tp_pct = self._cfg.take_profit_pct
         sl_pct = self._cfg.stop_loss_pct
-        if signal.side == SignalSide.LONG:
+        if side == SignalSide.LONG:
             tp_px = entry_px * (Decimal("1") + tp_pct)
             stop_px = entry_px * (Decimal("1") - sl_pct)
         else:
@@ -178,17 +258,57 @@ class BacktestSimulator:
 
         self._open[coin] = OpenPosition(
             coin=coin,
-            side=signal.side,
+            side=side,
             entry_px=entry_px,
             qty=qty,
             notional=notional,
-            entry_ts=signal.timestamp,
+            entry_ts=entry_ts,
             stop_px=stop_px,
             tp_px=tp_px,
             risk=notional * sl_pct,
             entry_fee=entry_fee,
             confidence=confidence,
-            reason=signal.reason,
+            reason=reason,
+            peak_px=entry_px,
+        )
+
+    def _check_pending_fills(
+        self, coin: str | None, price: Decimal, ts: datetime | None
+    ) -> None:
+        """Fill or expire a resting post-only entry.
+
+        A buy fills only when price trades back down to the order and a sell only
+        when it trades back up — which is exactly what a momentum entry usually
+        never does. Queue position is ignored, so this is still the optimistic
+        end of realistic.
+        """
+
+        if coin is None or ts is None:
+            return
+        key = coin.strip().upper()
+        pending = self._pending.get(key)
+        if pending is None:
+            return
+
+        timeout = self._cfg.maker_fill_timeout_seconds
+        if timeout > 0 and Decimal(str((ts - pending.placed_ts).total_seconds())) >= timeout:
+            del self._pending[key]
+            self._result.maker_orders_expired += 1
+            self._result.skipped_signals += 1
+            return
+
+        filled = (
+            price <= pending.limit_px
+            if pending.side == SignalSide.LONG
+            else price >= pending.limit_px
+        )
+        if not filled:
+            return
+
+        del self._pending[key]
+        self._result.maker_orders_filled += 1
+        self._open_position(
+            key, pending.side, pending.limit_px, ts, pending.confidence, pending.reason
         )
 
     def _check_exits(self, coin: str | None, price: Decimal, ts: datetime | None) -> None:
@@ -199,18 +319,47 @@ class BacktestSimulator:
         if pos is None or ts is None:
             return
 
+        is_long = pos.side == SignalSide.LONG
+
+        # Peak first, then break-even, then exits — the same order the live
+        # PositionManager evaluates them on every mark update.
+        pos.peak_px = max(pos.peak_px, price) if is_long else min(pos.peak_px, price)
+
+        be_trigger = self._cfg.break_even_trigger_pct
+        if be_trigger > 0 and not pos.break_even_armed:
+            gain = (price - pos.entry_px) / pos.entry_px
+            if not is_long:
+                gain = -gain
+            if gain >= be_trigger:
+                buf = self._cfg.fee_buffer_pct
+                if is_long:
+                    pos.stop_px = max(pos.stop_px, pos.entry_px * (Decimal("1") + buf))
+                else:
+                    pos.stop_px = min(pos.stop_px, pos.entry_px * (Decimal("1") - buf))
+                pos.break_even_armed = True
+
         exit_px: Decimal | None = None
         reason = ""
-        if pos.side == SignalSide.LONG:
+        has_tp = self._cfg.take_profit_pct > 0
+        if is_long:
             if price <= pos.stop_px:
                 exit_px, reason = pos.stop_px, "stop"
-            elif price >= pos.tp_px:
+            elif has_tp and price >= pos.tp_px:
                 exit_px, reason = pos.tp_px, "take_profit"
         else:
             if price >= pos.stop_px:
                 exit_px, reason = pos.stop_px, "stop"
-            elif price <= pos.tp_px:
+            elif has_tp and price <= pos.tp_px:
                 exit_px, reason = pos.tp_px, "take_profit"
+
+        callback = self._cfg.trailing_callback_pct
+        if exit_px is None and callback > 0:
+            # Live books the trail at the prevailing mark, not the trigger price.
+            if is_long:
+                if price <= pos.peak_px * (Decimal("1") - callback):
+                    exit_px, reason = price, "trailing_stop"
+            elif price >= pos.peak_px * (Decimal("1") + callback):
+                exit_px, reason = price, "trailing_stop"
 
         if exit_px is None and self._cfg.time_stop_seconds > 0:
             elapsed = Decimal(str((ts - pos.entry_ts).total_seconds()))
@@ -222,6 +371,10 @@ class BacktestSimulator:
             del self._open[key]
 
     def _close_remaining(self) -> None:
+        # Orders still resting at the end never became trades.
+        self._result.maker_orders_expired += len(self._pending)
+        self._result.skipped_signals += len(self._pending)
+        self._pending.clear()
         for key, pos in list(self._open.items()):
             mark = self._marks.get(key, pos.entry_px)
             self._book_exit(pos, mark, pos.entry_ts, "eod_mark")

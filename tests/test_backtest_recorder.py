@@ -154,3 +154,31 @@ def test_replay_skips_blank_lines(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert len(list(replay_file(path))) == 2
+
+
+def test_replay_skips_nul_padded_line(tmp_path: Path) -> None:
+    """An unclean shutdown can leave a NUL-padded line; replay must not abort.
+
+    Observed for real in events-2026-07-08.jsonl after a host reboot: one torn
+    line out of ~40M killed a whole sweep.
+    """
+    path = tmp_path / "events-2026-01-02.jsonl"
+    path.write_text(
+        serialize_event(_trade_event()) + "\n"
+        + "\x00\x00\x00\x00\n"
+        + serialize_event(_asset_ctx_event()) + "\n",
+        encoding="utf-8",
+    )
+    replayed = list(replay_file(path))
+    assert len(replayed) == 2  # both good events survive, bad line dropped
+
+
+def test_replay_skips_truncated_json_line(tmp_path: Path) -> None:
+    path = tmp_path / "events-2026-01-03.jsonl"
+    path.write_text(
+        serialize_event(_trade_event()) + "\n"
+        + '{"kind": "trade", "coin": "BT\n'  # torn mid-write
+        + serialize_event(_asset_ctx_event()) + "\n",
+        encoding="utf-8",
+    )
+    assert len(list(replay_file(path))) == 2
