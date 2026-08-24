@@ -70,6 +70,7 @@ FINGERPRINTED_FIELDS: tuple[str, ...] = (
     "dvsla_hurst_max",
     "dvsla_warmup_bars",
     "dvsla_cooldown_bars",
+    "dvsla_min_confidence",
     # Risk guards
     "correlation_guard_enabled",
     "correlation_max_same_side",

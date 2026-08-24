@@ -297,6 +297,19 @@ class HyperliquidSettings(BaseSettings):
     )
     dvsla_warmup_bars: int = Field(default=20, ge=0, validation_alias="DVSLA_WARMUP_BARS")
     dvsla_cooldown_bars: int = Field(default=10, ge=0, validation_alias="DVSLA_COOLDOWN_BARS")
+    # Reject signals whose confidence falls below this floor. Confidence measures
+    # agreement across the engine's confirmations, and on the full recording set
+    # the relationship to per-trade edge is monotonic: raising the floor lifts
+    # win rate and cuts the ordinary-day bleed that the rare cascades have to pay
+    # for. The gate belongs here rather than inside the strategy so a rejected
+    # signal still consumes its cooldown — the same order the sweep measured.
+    # 0 disables. See scripts/sweep_entry_threshold.py.
+    dvsla_min_confidence: Decimal = Field(
+        default=Decimal("0"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        validation_alias="DVSLA_MIN_CONFIDENCE",
+    )
     # Trade direction. The original thesis fades the cascade (mean-reversion);
     # recorded-data backtests show the cascades *continue* on the FAZ-0-Lite feed,
     # so inverting the side (trade WITH the cascade = momentum) is net-positive.

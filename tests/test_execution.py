@@ -36,6 +36,7 @@ def settings() -> HyperliquidSettings:
             "atr_stop_enabled": False,
             "reversion_tp_enabled": False,
             "reentry_cooldown_seconds": 0,
+            "dvsla_min_confidence": Decimal("0"),
         }
     )
 
@@ -71,12 +72,16 @@ def router(
     return OrderRouter(settings, rest, kill_switch, margin_manager, position_manager)
 
 
-def _signal(side: SignalSide = SignalSide.LONG, symbol: str = "BTC") -> TradeSignal:
+def _signal(
+    side: SignalSide = SignalSide.LONG,
+    symbol: str = "BTC",
+    confidence: Decimal = Decimal("0.8"),
+) -> TradeSignal:
     return TradeSignal(
         symbol=symbol,
         side=side,
         entry_mark_price=Decimal("50000"),
-        confidence=Decimal("0.8"),
+        confidence=confidence,
         timestamp=datetime.now(timezone.utc),
     )
 
@@ -725,6 +730,36 @@ async def test_confidence_sizing_scales_size(settings: HyperliquidSettings) -> N
     await router.route_entry(_signal(SignalSide.LONG))
     order = router.rest.place_order.await_args.args[0]
     assert abs(float(order.sz) - 0.9) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_confidence_floor_rejects_weak_signal(settings: HyperliquidSettings) -> None:
+    router = _build_router(settings.model_copy(update={"dvsla_min_confidence": Decimal("0.40")}))
+    result = await router.route_entry(_signal(confidence=Decimal("0.39")))
+    assert result is None
+    router.rest.place_order.assert_not_called()
+    assert "BTC" not in router.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_confidence_floor_admits_signal_at_threshold(
+    settings: HyperliquidSettings,
+) -> None:
+    router = _build_router(settings.model_copy(update={"dvsla_min_confidence": Decimal("0.40")}))
+    result = await router.route_entry(_signal(confidence=Decimal("0.40")))
+    assert result is not None
+    router.rest.place_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confidence_floor_of_zero_disables_the_gate(
+    settings: HyperliquidSettings,
+) -> None:
+    # A floor of 0 must mean "no gate", not "reject everything at or below 0".
+    router = _build_router(settings.model_copy(update={"dvsla_min_confidence": Decimal("0")}))
+    result = await router.route_entry(_signal(confidence=Decimal("0")))
+    assert result is not None
+    router.rest.place_order.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -123,6 +123,20 @@ class OrderRouter:
             logger.warning("Entry rejected for %s: %s", coin, exc)
             return None
 
+        floor = self.settings.dvsla_min_confidence
+        if floor > 0 and signal.confidence < floor:
+            # Filtering here rather than in the strategy is deliberate: the signal
+            # has already fired and consumed its cooldown, which is the order the
+            # threshold sweep measured. Moving this into the engine would let the
+            # next bar fire instead and change what the filter actually selects.
+            logger.info(
+                "Entry skipped for %s: confidence %.2f below floor %.2f",
+                coin,
+                float(signal.confidence),
+                float(floor),
+            )
+            return None
+
         if self._feed_warming_up(coin):
             return None
 
