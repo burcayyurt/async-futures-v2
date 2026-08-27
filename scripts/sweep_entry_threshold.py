@@ -81,6 +81,16 @@ def main() -> int:
         help="comma-separated ret_z_entry values (one strategy instance each)",
     )
     ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="YYYY-MM-DD",
+        help="drop a recording day (repeatable). The point is to check whether a "
+             "threshold's advantage survives without the sessions that produced "
+             "most of the profit — an edge that only exists on cascade days is a "
+             "statement about the regime, not about the threshold.",
+    )
+    ap.add_argument(
         "--conf",
         default=",".join(MIN_CONFIDENCES),
         help="comma-separated confidence floors. Sweep several to check the "
@@ -116,11 +126,15 @@ def main() -> int:
     files = sorted(Path(args.directory).glob("events-*.jsonl"))
     if args.since:
         files = [f for f in files if f.stem.replace("events-", "") >= args.since]
+    if args.exclude:
+        dropped = set(args.exclude)
+        files = [f for f in files if f.stem.replace("events-", "") not in dropped]
     if not files:
         print("No recordings matched.")
         return 1
 
-    print(f"Files: {len(files)}  ({files[0].stem} -> {files[-1].stem})")
+    print(f"Files: {len(files)}  ({files[0].stem} -> {files[-1].stem})"
+          + (f"  excluded: {','.join(sorted(args.exclude))}" if args.exclude else ""))
     print(f"Grid: ret_z {','.join(ret_z_entries)} x conf {','.join(min_confidences)}, realistic maker fills")
     print(f"Exit: time_stop={settings.max_hold_seconds}s trail=0 stop="
           f"{float(settings.atr_stop_min_pct) * 100:.2f}% fees="
