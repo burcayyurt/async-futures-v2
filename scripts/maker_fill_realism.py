@@ -36,9 +36,8 @@ import time
 from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
 
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from backtest.simulator import BacktestSimulator, SimConfig
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
@@ -134,11 +133,7 @@ def main() -> int:
         ("taker", InstantFillSimulator(strategy, cfg(False))),
     ]
 
-    files = sorted(Path(args.directory).glob("events-*.jsonl"))
-    if args.since:
-        files = [f for f in files if f.stem.replace("events-", "") >= args.since]
-    if args.exclude:
-        files = [f for f in files if f.stem.replace("events-", "") not in set(args.exclude)]
+    files = recording_files(args.directory, since=args.since, exclude=args.exclude)
     if args.days:
         files = files[-args.days:]
     if not files:

@@ -7,3 +7,12 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    # Docker's json-file driver keeps every line forever by default. The bot
+    # logs an activity summary every five minutes plus a line per signal, which
+    # is harmless on a workstation and a slow disk-filler on a small host —
+    # where the disk it fills is the one holding the recordings.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -28,9 +28,8 @@ import statistics
 import time
 from datetime import datetime
 from decimal import Decimal
-from pathlib import Path
 
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from backtest.simulator import BacktestSimulator, SimConfig
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
@@ -83,7 +82,7 @@ def main() -> int:
         for ts, tr, mk in combos
     ]
 
-    files = sorted(Path(args.directory).glob("events-*.jsonl"))
+    files = recording_files(args.directory)
     if args.days:
         files = files[-args.days:]
     print(f"Files: {len(files)}   Grid: {len(combos)} (time-stop x trail x maker-fill)")

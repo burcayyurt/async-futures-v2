@@ -24,9 +24,8 @@ import statistics
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
     AssetCtxPayload,
@@ -138,7 +137,7 @@ def main() -> int:
                 keep.append(p)
         queue.extend(keep)
 
-    files = sorted(Path(args.directory).glob("events-*.jsonl"))
+    files = recording_files(args.directory)
     if args.days:
         files = files[-args.days:]
     print(f"Files: {len(files)}   horizons: {HORIZONS}s   invert={params.invert}")

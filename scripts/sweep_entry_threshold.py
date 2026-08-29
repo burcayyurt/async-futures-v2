@@ -35,9 +35,8 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
-from pathlib import Path
 
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from backtest.simulator import BacktestSimulator, SimConfig
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
@@ -123,12 +122,7 @@ def main() -> int:
         sims = [(Decimal(c), BacktestSimulator(None, cfg())) for c in min_confidences]
         strategies.append((rz, DvslaStrategy(params), sims))
 
-    files = sorted(Path(args.directory).glob("events-*.jsonl"))
-    if args.since:
-        files = [f for f in files if f.stem.replace("events-", "") >= args.since]
-    if args.exclude:
-        dropped = set(args.exclude)
-        files = [f for f in files if f.stem.replace("events-", "") not in dropped]
+    files = recording_files(args.directory, since=args.since, exclude=args.exclude)
     if not files:
         print("No recordings matched.")
         return 1

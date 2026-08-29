@@ -34,7 +34,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from backtest.metrics import compute_metrics
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from backtest.simulator import BacktestSimulator, SimConfig
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
@@ -62,7 +62,7 @@ def _price_and_ts(event: MarketEvent) -> tuple[Decimal | None, datetime | None]:
 
 
 def _iter_files(directory: str, days: int | None, first: int | None) -> list[Path]:
-    files = sorted(Path(directory).glob("events-*.jsonl"))
+    files = recording_files(directory)
     if first is not None and first > 0:
         return files[:first]
     if days is not None and days > 0:

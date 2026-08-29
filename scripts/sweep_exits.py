@@ -23,9 +23,8 @@ import asyncio
 import itertools
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
 
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
     AssetCtxPayload,
@@ -173,7 +172,7 @@ def main() -> int:
 
     cfgs = [_Cfg(be, tr, st) for be, tr, st in itertools.product(BE_TRIGGERS, TRAILING, INIT_STOPS)]
 
-    files = sorted(Path(args.directory).glob("events-*.jsonl"))
+    files = recording_files(args.directory)
     if args.first:
         files = files[: args.first]
     elif args.days:

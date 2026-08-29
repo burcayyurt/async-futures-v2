@@ -24,7 +24,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from backtest.metrics import compute_metrics
-from backtest.replay import replay_file
+from backtest.replay import recording_files, replay_file
 from backtest.simulator import BacktestSimulator, SimConfig
 from src.core.config import HyperliquidSettings
 from src.exchange.hyperliquid_ws import (
@@ -61,7 +61,7 @@ def _grid() -> dict[str, list[Decimal]]:
 
 
 def _iter_files(directory: str, days: int | None, first: int | None) -> list[Path]:
-    files = sorted(Path(directory).glob("events-*.jsonl"))
+    files = recording_files(directory)
     if first is not None and first > 0:
         files = files[:first]
     elif days is not None and days > 0:
