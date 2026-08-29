@@ -1,7 +1,8 @@
 """Price the round trip: how far does the market move while an order is in flight?
 
-The bot runs from Istanbul and the Hyperliquid origin answers in ~258 ms, so a
-post-only entry is placed against a mark the market has already left behind. The
+The workstation the bot has been running on sits ~258 ms from the Hyperliquid
+origin (measured, not assumed), so a post-only entry is placed against a mark
+the market has already left behind. The
 question that decides whether closer hosting is worth paying for is not the ping
 figure — it is how many basis points the price travels during that window, in the
 direction the signal just called.
@@ -80,7 +81,8 @@ def main() -> int:
         "--horizons",
         default="15,30,60,130,260,500",
         help="milliseconds of in-flight delay to price (comma separated). 260 is "
-             "the measured round trip from Istanbul, ~15 what a Tokyo host would "
+             "the round trip measured from the workstation, ~15 what a Tokyo "
+             "host sees. "
              "see. Sweeping the short end answers the question the ping figure "
              "cannot: whether the move is spread across the window (closer "
              "hosting recovers most of it) or already finished in the first "

@@ -2,8 +2,9 @@
 
 ## Why the bot is moving at all
 
-Not for latency. That was measured and dismissed: from Istanbul the Hyperliquid
-origin answers in ~258 ms, but the price gap between a signal and the market is
+Not for latency. That was measured and dismissed: the workstation is ~258 ms
+from the Hyperliquid origin and a Tokyo host is 14 ms, but the price gap between
+a signal and the market is
 already ~14 bps at the first tick after the signal and does not grow over the
 next half second (`scripts/latency_cost.py`, n=362). A host in Tokyo would
 arrive to find the same gap. The entry is behind the market because of how it is
