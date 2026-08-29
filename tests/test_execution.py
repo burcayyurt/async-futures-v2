@@ -979,3 +979,68 @@ async def test_taker_dry_run_still_opens_immediately() -> None:
 
     assert router._pending == {}
     assert "BTC" in router.position_manager.positions
+
+
+# --- maker entry offset -----------------------------------------------------
+
+
+def _placed_order(router: OrderRouter) -> object:
+    return router.rest.place_order.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_offset_of_zero_quotes_at_the_signal_mark() -> None:
+    router = _maker_router(maker_entry_offset_bps=Decimal("0"))
+
+    await router.route_entry(_signal(side=SignalSide.LONG))
+
+    assert Decimal(_placed_order(router).limit_px) == Decimal("50000")
+
+
+@pytest.mark.asyncio
+async def test_offset_quotes_a_long_above_and_a_short_below_the_mark() -> None:
+    # Into the signal's own direction: 2 bps of 50000 is 10.
+    router = _maker_router(maker_entry_offset_bps=Decimal("2"))
+    await router.route_entry(_signal(side=SignalSide.LONG, symbol="BTC"))
+    assert Decimal(_placed_order(router).limit_px) == Decimal("50010.0")
+
+    router = _maker_router(maker_entry_offset_bps=Decimal("2"))
+    await router.route_entry(_signal(side=SignalSide.SHORT, symbol="ETH"))
+    assert Decimal(_placed_order(router).limit_px) == Decimal("49990.0")
+
+
+@pytest.mark.asyncio
+async def test_offset_turns_a_flat_market_into_a_rejection() -> None:
+    # This is the whole mechanism: at 0 the order would have rested at the mark
+    # and eventually filled, and with the offset the same tick refuses it.
+    router = _maker_router(maker_entry_offset_bps=Decimal("2"))
+    await router.route_entry(_signal(side=SignalSide.LONG, symbol="BTC"))
+
+    await router.on_mark("BTC", Decimal("50000"))  # market has not moved
+
+    assert router._pending == {}
+    assert router.position_manager.positions == {}
+
+
+@pytest.mark.asyncio
+async def test_offset_does_not_touch_a_taker_entry() -> None:
+    # An IOC price is a slippage pad, not a quote; the offset has no business
+    # moving it.
+    router = _maker_router(maker_entry_enabled=False, maker_entry_offset_bps=Decimal("2"))
+
+    await router.route_entry(_signal(side=SignalSide.LONG))
+
+    order = _placed_order(router)
+    assert order.tif == "Ioc"
+    assert Decimal(order.limit_px) == Decimal("50000") * (Decimal("1") + Decimal("0.01"))
+
+
+def test_offset_is_fingerprinted() -> None:
+    # Two runs that quote differently are two configurations, and the journal
+    # has to be sliceable by that.
+    from src.core.config_fingerprint import config_id
+
+    base = HyperliquidSettings.from_env()
+    assert config_id(base.model_copy(update={"maker_entry_offset_bps": Decimal("2")})) != config_id(
+        base
+    )

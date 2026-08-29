@@ -200,8 +200,11 @@ class OrderRouter:
 
         is_buy = signal.side == SignalSide.LONG
         if self.settings.maker_entry_enabled:
-            # Passive post-only maker entry at the signal price (no spread cross).
-            limit_px = signal.entry_mark_price
+            # Passive post-only maker entry, quoted into the signal's direction by
+            # maker_entry_offset_bps. The offset is a filter, not a chase: an
+            # order the market has already passed is rejected rather than filled,
+            # which is how the fast-runaway signals get skipped.
+            limit_px = self._maker_limit_price(signal.entry_mark_price, signal.side)
             tif: str = "Alo"
         else:
             limit_px = self._slippage_price(signal.entry_mark_price, is_buy, self.market_slippage_pct)
@@ -250,6 +253,13 @@ class OrderRouter:
             result.get("status", result),
         )
         return result
+
+    def _maker_limit_price(self, mark_px: Decimal, side: SignalSide) -> Decimal:
+        offset = self.settings.maker_entry_offset_bps
+        if offset <= 0:
+            return mark_px
+        sign = Decimal("1") if side == SignalSide.LONG else Decimal("-1")
+        return mark_px * (Decimal("1") + sign * offset / Decimal("10000"))
 
     def _simulates_maker_fills(self) -> bool:
         """Whether this process has to model the exchange's post-only handling.

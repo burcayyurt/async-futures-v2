@@ -37,6 +37,7 @@ FINGERPRINTED_FIELDS: tuple[str, ...] = (
     "confidence_size_floor",
     # Entry mechanics
     "maker_entry_enabled",
+    "maker_entry_offset_bps",
     "reentry_cooldown_seconds",
     "ws_reconnect_entry_cooldown_seconds",
     # Exit mechanics

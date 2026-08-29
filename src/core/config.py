@@ -161,6 +161,27 @@ class HyperliquidSettings(BaseSettings):
 
     # --- Execution upgrades (PR5). Opt-in; defaults preserve legacy behavior. ---
     maker_entry_enabled: bool = Field(default=False, validation_alias="MAKER_ENTRY_ENABLED")
+    # How far into the signal's own direction the post-only entry is quoted: a
+    # long bids this many basis points above the signal mark instead of at it.
+    #
+    # This is not about getting filled sooner — it is the opposite. A post-only
+    # order that would cross on arrival is rejected, so raising the quote refuses
+    # exactly the signals whose price has already run past it, and recorded data
+    # says those are the ones that lose money. Raising it therefore trades sample
+    # size for quality, the same bargain dvsla_min_confidence makes.
+    #
+    # Aug 5-29 ex-cascade and Jun-Jul (out of sample), realistic fills:
+    #     0 bps   +0.05 bps t +0.02  |  +4.60 bps t +2.55
+    #     2 bps   +5.64 bps t +1.43  | +12.96 bps t +4.12
+    # Capped well below a level that would make the order marketable outright;
+    # only applies to post-only entries. 0 disables. See
+    # scripts/sweep_entry_aggression.py.
+    maker_entry_offset_bps: Decimal = Field(
+        default=Decimal("0"),
+        ge=Decimal("0"),
+        le=Decimal("50"),
+        validation_alias="MAKER_ENTRY_OFFSET_BPS",
+    )
     # Exchange fees in basis points, mirroring ``backtest.simulator.SimConfig`` so
     # live journal PnL and backtest PnL are directly comparable. Entries are maker
     # only when ``maker_entry_enabled`` (Alo/post-only); exits are always IOC
