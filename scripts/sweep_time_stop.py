@@ -72,6 +72,14 @@ def main() -> int:
     )
     ap.add_argument("--trails", default=",".join(TRAILS))
     ap.add_argument(
+        "--stops",
+        default=None,
+        help="hard-stop distances as fractions, e.g. 0.012,0.025,0. A stop "
+             "calibrated for a one-minute hold is not a fair companion to a "
+             "two-hour one: over the longer window ordinary noise reaches it, "
+             "and each trigger costs the full stop distance.",
+    )
+    ap.add_argument(
         "--maker",
         default="true",
         help="true (realistic post-only), false (instant fill), or both",
@@ -85,13 +93,18 @@ def main() -> int:
     settings = HyperliquidSettings.from_env()
     strategy = DvslaStrategy(DvslaParams.from_settings(settings))
 
-    combos = list(itertools.product(time_stops, trails, maker))
+    stops = (
+        [Decimal(x.strip()) for x in args.stops.split(",") if x.strip()]
+        if args.stops
+        else [settings.atr_stop_min_pct]
+    )
+    combos = list(itertools.product(time_stops, trails, maker, stops))
     sims = [
         BacktestSimulator(
             strategy,
             SimConfig(
                 take_profit_pct=Decimal("0"),
-                stop_loss_pct=settings.atr_stop_min_pct,
+                stop_loss_pct=sl,
                 time_stop_seconds=Decimal(ts),
                 trailing_callback_pct=Decimal(tr),
                 break_even_trigger_pct=Decimal("0"),
@@ -100,7 +113,7 @@ def main() -> int:
                 taker_fee_bps=settings.taker_fee_bps,
             ),
         )
-        for ts, tr, mk in combos
+        for ts, tr, mk, sl in combos
     ]
 
     files = recording_files(
@@ -108,7 +121,7 @@ def main() -> int:
     )
     if args.days:
         files = files[-args.days:]
-    print(f"Files: {len(files)}   Grid: {len(combos)} (time-stop x trail x maker-fill)"
+    print(f"Files: {len(files)}   Grid: {len(combos)} (time-stop x trail x maker x stop)"
           + (f"   excluded: {','.join(sorted(args.exclude))}" if args.exclude else ""))
     print(f"Fixed: TP=off  stop={float(settings.atr_stop_min_pct) * 100:.2f}%  "
           f"fees={float(settings.maker_fee_bps)}/{float(settings.taker_fee_bps)}bps\n")
@@ -140,16 +153,16 @@ def main() -> int:
     # bps alongside dollars because every other study here reports bps, and
     # skipped because a long hold occupies one of five slots for its whole
     # length — a horizon can look good per trade and still take far fewer.
-    print(f"{'tstop':>6} {'trail%':>7} {'maker':>6} {'fill%':>6} {'n':>5} {'skip':>6} "
+    print(f"{'tstop':>6} {'stop%':>6} {'maker':>6} {'fill%':>6} {'n':>5} {'skip':>6} "
           f"{'win%':>5} {'net$':>9} {'bps':>7} {'t':>7}  exit reasons")
     print("-" * 108)
-    for (ts, tr, mk), sim in zip(combos, sims):
+    for (ts, tr, mk, sl), sim in zip(combos, sims):
         nets = [float(t.net_pnl) for t in sim._result.trades]
         r = sim._result
         placed = r.maker_orders_placed
         fill_rate = (r.maker_orders_filled / placed * 100) if placed else 100.0
         if len(nets) < 2:
-            print(f"{ts:>6} {float(tr) * 100:7.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d}"
+            print(f"{ts:>6} {float(sl) * 100:6.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d}"
                   f"   (too few trades)")
             continue
         bps = [float(t.net_pnl / t.notional * Decimal("10000"))
@@ -163,7 +176,7 @@ def main() -> int:
             reasons[tr_.exit_reason] = reasons.get(tr_.exit_reason, 0) + 1
         reason_str = " ".join(f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
         mean_bps = statistics.mean(bps) if bps else float("nan")
-        print(f"{ts:>6} {float(tr) * 100:7.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d} "
+        print(f"{ts:>6} {float(sl) * 100:6.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d} "
               f"{r.skipped_signals:6d} {wins / len(nets) * 100:5.0f} {sum(nets):9.2f} "
               f"{mean_bps:7.2f} {tstat:+7.2f}  {reason_str}")
     return 0
