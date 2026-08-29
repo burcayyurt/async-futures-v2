@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -22,6 +23,31 @@ from src.strategy.signals import SignalSide, TradeSignal
 logger = logging.getLogger(__name__)
 
 DRY_RUN_FALLBACK_COLLATERAL = Decimal("1000")
+
+
+@dataclass
+class PendingEntry:
+    """A post-only entry that has been sent but is not a position yet.
+
+    Dry-run only. Live, the exchange does all of this and reports back; here
+    nothing is actually sent, so the two things it would have done have to be
+    modelled or the journal quietly overstates the result:
+
+    * a post-only order that would cross on arrival is **rejected**, and
+    * one that rests fills only if price comes back to touch it.
+
+    Dry-run previously did neither and opened every position instantly at the
+    signal mark — the optimistic end of both assumptions at once. Recorded data
+    puts the cost of that at roughly a sixth of signals rejected outright and
+    another quarter never filled.
+    """
+
+    coin: str
+    side: SignalSide
+    limit_px: Decimal
+    size: Decimal
+    placed_at: datetime
+    arrived: bool = False
 
 
 class OrderRouter:
@@ -50,7 +76,9 @@ class OrderRouter:
         # currently down. Used to gate entries during the post-reconnect warm-up.
         self._feed_health = feed_health
         self._last_exit_at: dict[str, datetime] = {}
+        self._pending: dict[str, PendingEntry] = {}
         self.position_manager.bind_exit_handler(self.route_exit)
+        self.position_manager.bind_mark_observer(self.on_mark)
 
     def _feed_warming_up(self, coin: str) -> bool:
         if self._feed_health is None:
@@ -144,6 +172,10 @@ class OrderRouter:
             logger.info("Entry skipped for %s: position already open", coin)
             return None
 
+        if coin in self._pending:
+            logger.info("Entry skipped for %s: a post-only entry is already resting", coin)
+            return None
+
         now = datetime.now(timezone.utc)
         if self._in_cooldown(coin, now):
             logger.info("Entry skipped for %s: re-entry cooldown active", coin)
@@ -191,19 +223,24 @@ class OrderRouter:
             logger.warning("Entry rejected by exchange for %s: %s", coin, rejection)
             return None
 
-        position = ManagedPosition(
-            coin=coin,
-            side=signal.side,
-            entry_px=signal.entry_mark_price,
-            size=Decimal(str(size)),
-            stop_px=self.position_manager.compute_initial_stop(
-                coin, signal.entry_mark_price, signal.side
-            ),
-            peak_px=signal.entry_mark_price,
-        )
-        await self.position_manager.register_position(position)
-        if self._telegram is not None:
-            self._telegram.notify_entry(coin, signal.side, signal.entry_mark_price, Decimal(str(size)))
+        if self._simulates_maker_fills():
+            self._pending[coin] = PendingEntry(
+                coin=coin,
+                side=signal.side,
+                limit_px=limit_px,
+                size=Decimal(str(size)),
+                placed_at=datetime.now(timezone.utc),
+            )
+            logger.info(
+                "Entry resting for %s %s size=%s limit=%s (post-only, awaiting fill)",
+                coin,
+                signal.side.value,
+                size,
+                limit_px,
+            )
+            return result
+
+        await self._open_position(coin, signal.side, signal.entry_mark_price, Decimal(str(size)))
         logger.info(
             "Entry routed for %s %s size=%s mark=%s result=%s",
             coin,
@@ -213,6 +250,88 @@ class OrderRouter:
             result.get("status", result),
         )
         return result
+
+    def _simulates_maker_fills(self) -> bool:
+        """Whether this process has to model the exchange's post-only handling.
+
+        Live it must not: the exchange rejects or fills for real and says so.
+        Only dry-run with a post-only entry has nobody to do it.
+        """
+
+        return self.settings.bot_dry_run and self.settings.maker_entry_enabled
+
+    async def _open_position(
+        self, coin: str, side: SignalSide, entry_px: Decimal, size: Decimal
+    ) -> None:
+        position = ManagedPosition(
+            coin=coin,
+            side=side,
+            entry_px=entry_px,
+            size=size,
+            stop_px=self.position_manager.compute_initial_stop(coin, entry_px, side),
+            peak_px=entry_px,
+        )
+        await self.position_manager.register_position(position)
+        if self._telegram is not None:
+            self._telegram.notify_entry(coin, side, entry_px, size)
+
+    async def on_mark(self, coin: str, mark_px: Decimal) -> None:
+        """Age a resting simulated entry against a fresh mark.
+
+        The first mark after placement stands in for the order reaching the
+        exchange. If the limit is through the market by then, the order would
+        have been rejected as marketable and the signal is simply lost — which
+        is the interesting half: those are the signals whose price has already
+        run away, and recorded data says they are the ones that lose money.
+        """
+
+        pending = self._pending.get(coin)
+        if pending is None:
+            return
+
+        if not pending.arrived:
+            pending.arrived = True
+            crosses = (
+                pending.limit_px > mark_px
+                if pending.side == SignalSide.LONG
+                else pending.limit_px < mark_px
+            )
+            if crosses:
+                del self._pending[coin]
+                logger.info(
+                    "Entry rejected for %s: post-only %s at %s would cross a market at %s",
+                    coin,
+                    pending.side.value,
+                    pending.limit_px,
+                    mark_px,
+                )
+            return
+
+        timeout = self.settings.max_hold_seconds
+        if timeout > 0:
+            age = Decimal(str((datetime.now(timezone.utc) - pending.placed_at).total_seconds()))
+            if age >= timeout:
+                del self._pending[coin]
+                logger.info("Entry expired for %s: post-only unfilled after %ss", coin, timeout)
+                return
+
+        filled = (
+            mark_px <= pending.limit_px
+            if pending.side == SignalSide.LONG
+            else mark_px >= pending.limit_px
+        )
+        if not filled:
+            return
+
+        del self._pending[coin]
+        logger.info(
+            "Entry filled for %s %s size=%s at %s (post-only)",
+            coin,
+            pending.side.value,
+            pending.size,
+            pending.limit_px,
+        )
+        await self._open_position(coin, pending.side, pending.limit_px, pending.size)
 
     async def route_exit(self, position: ManagedPosition, reason: str) -> dict[str, Any] | None:
         coin = position.coin.strip().upper()

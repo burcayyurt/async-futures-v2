@@ -26,6 +26,7 @@ PEAK_PERSIST_DEBOUNCE_SECONDS = 5.0
 SIZE_RECONCILE_TOLERANCE = Decimal("0.001")
 
 ExitHandler = Callable[["ManagedPosition", str], Awaitable[None]]
+MarkObserver = Callable[[str, Decimal], Awaitable[None]]
 ExchangePositionFetcher = Callable[[], Awaitable[dict[str, ExchangePosition]]]
 
 
@@ -117,6 +118,7 @@ class PositionManager:
         self._exchange_positions = exchange_positions
         self._positions: dict[str, ManagedPosition] = {}
         self._exit_handler: ExitHandler | None = None
+        self._mark_observer: MarkObserver | None = None
         self._panic_in_progress = False
         self._last_peak_persist: dict[str, datetime] = {}
         self._mark_trackers: dict[str, _MarkTracker] = {}
@@ -125,6 +127,18 @@ class PositionManager:
     @property
     def positions(self) -> dict[str, ManagedPosition]:
         return dict(self._positions)
+
+    def bind_mark_observer(self, handler: MarkObserver) -> None:
+        """Register a callback fed every fresh mark, before position management.
+
+        The order router uses this to age its simulated resting entries. It is a
+        callback rather than a second queue consumer so that both see exactly the
+        same ticks in the same order — a resting order that filled from a tick the
+        position manager never saw would be a fill the stop logic cannot reason
+        about.
+        """
+
+        self._mark_observer = handler
 
     def bind_exit_handler(self, handler: ExitHandler) -> None:
         self._exit_handler = handler
@@ -568,6 +582,12 @@ class PositionManager:
         # Keep the volatility / reversion trackers warm even before a position
         # exists, so ATR-stop and reversion-TP are ready the moment one opens.
         self._tracker(normalized).update(mark_px)
+
+        # Resting entries age on fresh ticks only, for the same reason stops do:
+        # the first tick after a blackout is a discontinuity, and filling an
+        # order against it would invent a trade at a price that never traded.
+        if self._mark_observer is not None:
+            await self._mark_observer(normalized, mark_px)
 
         position = self._positions.get(normalized)
         if position is None:

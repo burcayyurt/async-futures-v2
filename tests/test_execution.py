@@ -856,3 +856,126 @@ async def test_reversion_take_profit_exits_long_at_mean(
     assert exits == ["reversion_tp"]
 
 
+
+
+# --- simulated post-only lifecycle (dry-run only) ---------------------------
+#
+# Dry-run sends nothing, so nothing rejects and nothing has to be touched to
+# fill. Every number the journal has produced carried both of those freebies.
+# These cover the modelled versions.
+
+
+def _maker_router(**overrides: object) -> OrderRouter:
+    base: dict[str, object] = {
+        "bot_dry_run": True,
+        "maker_entry_enabled": True,
+        "confidence_sizing_enabled": False,
+        "atr_stop_enabled": False,
+        "reversion_tp_enabled": False,
+        "reentry_cooldown_seconds": 0,
+        "dvsla_min_confidence": Decimal("0"),
+        "max_hold_seconds": Decimal("60"),
+        "mark_staleness_gap_seconds": Decimal("0"),  # no blackout guard in tests
+    }
+    base.update(overrides)
+    return _build_router(HyperliquidSettings.from_env().model_copy(update=base))
+
+
+@pytest.mark.asyncio
+async def test_post_only_entry_rests_instead_of_opening_a_position() -> None:
+    router = _maker_router()
+
+    await router.route_entry(_signal(symbol="BTC"))
+
+    assert router.position_manager.positions == {}, "the order has not filled yet"
+    assert "BTC" in router._pending
+
+
+@pytest.mark.asyncio
+async def test_post_only_entry_is_rejected_when_it_would_cross_on_arrival() -> None:
+    # Long resting at 50000; by the time the order lands the market is at 49900,
+    # so the bid is through it and a real exchange refuses the order outright.
+    router = _maker_router()
+    await router.route_entry(_signal(side=SignalSide.LONG, symbol="BTC"))
+
+    await router.on_mark("BTC", Decimal("49900"))
+
+    assert router._pending == {}
+    assert router.position_manager.positions == {}
+
+
+@pytest.mark.asyncio
+async def test_post_only_entry_fills_when_price_comes_back_to_it() -> None:
+    router = _maker_router()
+    await router.route_entry(_signal(side=SignalSide.LONG, symbol="BTC"))
+
+    await router.on_mark("BTC", Decimal("50100"))  # arrival: rests below the market
+    assert "BTC" in router._pending
+    assert router.position_manager.positions == {}
+
+    await router.on_mark("BTC", Decimal("50000"))  # price returns and touches it
+
+    assert router._pending == {}
+    position = router.position_manager.positions["BTC"]
+    # Filled at the limit, not at whatever the mark happened to be.
+    assert position.entry_px == Decimal("50000")
+
+
+@pytest.mark.asyncio
+async def test_short_post_only_entry_is_rejected_when_market_is_above_it() -> None:
+    router = _maker_router()
+    await router.route_entry(_signal(side=SignalSide.SHORT, symbol="BTC"))
+
+    await router.on_mark("BTC", Decimal("50100"))  # ask through the offer
+
+    assert router._pending == {}
+    assert router.position_manager.positions == {}
+
+
+@pytest.mark.asyncio
+async def test_resting_entry_expires_unfilled_after_the_hold_window() -> None:
+    router = _maker_router()
+    await router.route_entry(_signal(side=SignalSide.LONG, symbol="BTC"))
+    await router.on_mark("BTC", Decimal("50100"))  # arrives and rests
+
+    router._pending["BTC"].placed_at -= timedelta(seconds=61)
+    await router.on_mark("BTC", Decimal("50100"))
+
+    assert router._pending == {}
+    assert router.position_manager.positions == {}
+
+
+@pytest.mark.asyncio
+async def test_second_signal_is_skipped_while_an_entry_is_resting() -> None:
+    router = _maker_router()
+    await router.route_entry(_signal(symbol="BTC"))
+    router.rest.place_order.reset_mock()
+
+    result = await router.route_entry(_signal(symbol="BTC"))
+
+    assert result is None
+    router.rest.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_mode_does_not_simulate_the_exchange() -> None:
+    # Live, the exchange rejects and fills for real and reports back; modelling
+    # it here as well would double-count and hide real fills behind a guess.
+    router = _maker_router(bot_dry_run=False, wallet_address="0x" + "1" * 40)
+
+    await router.route_entry(_signal(symbol="BTC"))
+
+    assert router._pending == {}
+    assert "BTC" in router.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_taker_dry_run_still_opens_immediately() -> None:
+    # Nothing to model without a post-only order: an IOC either fills or does
+    # not, and the response says which.
+    router = _maker_router(maker_entry_enabled=False)
+
+    await router.route_entry(_signal(symbol="BTC"))
+
+    assert router._pending == {}
+    assert "BTC" in router.position_manager.positions
