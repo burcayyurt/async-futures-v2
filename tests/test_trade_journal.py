@@ -20,11 +20,26 @@ def journal_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def journal(journal_path: Path) -> TradeJournal:
-    settings = HyperliquidSettings.from_env().model_copy(
-        update={"trade_journal_path": str(journal_path), "bot_dry_run": True, "leverage": 10}
+def journal_settings(journal_path: Path) -> HyperliquidSettings:
+    # The fee assertions below name their rates ("maker entry 1.5bps, taker exit
+    # 4.5bps"), so this states them rather than inheriting whatever the ambient
+    # configuration happens to be. maker_entry_enabled defaults to False, which
+    # charges the taker rate on entry and makes those numbers wrong.
+    return HyperliquidSettings.from_env().model_copy(
+        update={
+            "trade_journal_path": str(journal_path),
+            "bot_dry_run": True,
+            "leverage": 10,
+            "maker_entry_enabled": True,
+            "maker_fee_bps": Decimal("1.5"),
+            "taker_fee_bps": Decimal("4.5"),
+        }
     )
-    return TradeJournal(settings, path=journal_path)
+
+
+@pytest.fixture
+def journal(journal_settings: HyperliquidSettings, journal_path: Path) -> TradeJournal:
+    return TradeJournal(journal_settings, path=journal_path)
 
 
 def _position(
@@ -165,12 +180,18 @@ def test_register_config_appends_once_per_configuration(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recorded_trade_carries_config_id(journal: TradeJournal) -> None:
+async def test_recorded_trade_carries_config_id(
+    journal: TradeJournal, journal_settings: HyperliquidSettings
+) -> None:
     await journal.record_closed_trade(
         _position(), Decimal("101"), Decimal("1"), Decimal("10"), "trailing_stop"
     )
     trade = (await journal.load_all_closed_trades())[0]
-    assert trade.config_id == config_id(HyperliquidSettings.from_env())
+    # Against the journal's own settings, not a fresh read: the row has to
+    # identify the configuration that produced it, which is the entire point of
+    # carrying the id. Comparing to from_env() only matched while the fixture
+    # happened to change nothing that is fingerprinted.
+    assert trade.config_id == config_id(journal_settings)
 
 
 @pytest.mark.asyncio
