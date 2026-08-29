@@ -10,3 +10,6 @@ __pycache__/
 venv/
 *.log
 *.txt
+# requirements.txt is tracked despite the rule above: without it the image
+# cannot be built on a host that only has the repository.
+!requirements.txt

@@ -1,0 +1,29 @@
+# Runs the suite on every push and pull request.
+#
+# This is deliberately CI only — it builds nothing and deploys nowhere. Once the
+# bot runs on a host you cannot see, the failure worth preventing is discovering
+# a broken commit from its absence of trades, and that is what a red check on
+# the commit you were about to deploy prevents. Deployment stays a deliberate
+# act (scripts/deploy.sh), so no SSH key ever has to live in repository secrets.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match the Dockerfile: the interpreter that runs in production is the
+          # one whose result means something.
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m pytest -q

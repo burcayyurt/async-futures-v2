@@ -1,0 +1,13 @@
+# Shell scripts are sent to a Linux host — deploy.sh pipes a heredoc straight
+# into a remote `bash -s`, where a CR at the end of every line is a syntax
+# error. Checking them out with CRLF on Windows would break the deploy in a way
+# that reads as a mysterious remote failure.
+*.sh text eol=lf
+
+# The recorder writes LF and the replayer strips whitespace, but keeping the
+# rest of the tree consistent avoids diffs that are nothing but line endings.
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
