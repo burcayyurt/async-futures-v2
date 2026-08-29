@@ -14,15 +14,20 @@ worse than failing outright.
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
+from backtest.recording_paths import (
+    RECORDING_SUFFIXES,
+    open_recording,
+    recording_date,
+    recording_files,
+)
 from src.exchange.hyperliquid_ws import (
     AssetCtxPayload,
     EventKind,
@@ -69,58 +74,6 @@ def deserialize_event(line: str | dict[str, Any]) -> MarketEvent:
         payload = raw_payload if isinstance(raw_payload, dict) else {}
 
     return MarketEvent(kind=kind, coin=coin, ts=ts, payload=payload)
-
-
-RECORDING_SUFFIXES = (".jsonl", ".jsonl.gz")
-
-
-def recording_date(path: Path | str) -> str:
-    """The ``YYYY-MM-DD`` a recording file covers, from its name."""
-
-    name = Path(path).name
-    for suffix in RECORDING_SUFFIXES:
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return name.removeprefix("events-")
-
-
-def recording_files(
-    directory: Path | str,
-    *,
-    since: str | None = None,
-    exclude: Iterable[str] = (),
-) -> list[Path]:
-    """Recording files for a directory, in chronological order.
-
-    Compressed and uncompressed recordings are found together and ordered by
-    the date in the name rather than by filename, so ``.jsonl`` and
-    ``.jsonl.gz`` interleave correctly. When a day exists in both forms the
-    plain file wins: compaction verifies the archive before removing its
-    source, so during that window the source is the authoritative copy.
-    """
-
-    directory = Path(directory)
-    dropped = set(exclude)
-    by_date: dict[str, Path] = {}
-    for suffix in reversed(RECORDING_SUFFIXES):  # plain last, so it overwrites
-        for path in directory.glob(f"events-*{suffix}"):
-            date = recording_date(path)
-            if since is not None and date < since:
-                continue
-            if date in dropped:
-                continue
-            by_date[date] = path
-    return [by_date[d] for d in sorted(by_date)]
-
-
-def open_recording(path: Path | str) -> IO[str]:
-    """Open a recording for reading, transparently decompressing ``.gz``."""
-
-    file_path = Path(path)
-    if file_path.name.endswith(".gz"):
-        return gzip.open(file_path, "rt", encoding="utf-8", errors="replace")
-    return file_path.open("r", encoding="utf-8", errors="replace")
 
 
 def replay_file(path: Path | str) -> Iterator[MarketEvent]:
@@ -171,3 +124,14 @@ class EventReplayer:
     def __iter__(self) -> Iterator[MarketEvent]:
         for path in self._paths:
             yield from replay_file(path)
+
+
+__all__ = [
+    "EventReplayer",
+    "RECORDING_SUFFIXES",
+    "deserialize_event",
+    "open_recording",
+    "recording_date",
+    "recording_files",
+    "replay_file",
+]

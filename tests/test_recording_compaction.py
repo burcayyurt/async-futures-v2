@@ -153,3 +153,58 @@ def test_main_skips_a_day_that_already_has_an_archive(tmp_path: Path) -> None:
         sys.argv = argv
 
     assert path.exists(), "an existing archive must not be silently overwritten"
+
+
+def test_compaction_imports_without_the_bots_dependencies() -> None:
+    """The cron path must import on an interpreter that has only the stdlib.
+
+    This is not hypothetical tidiness. The nightly job runs from cron on the
+    bot's host against the system interpreter, where none of the bot's packages
+    are installed, and the first version of it failed there on ``websockets``
+    while passing every test here — because the test environment has the
+    dependencies that the host does not. Blocking them explicitly is the only
+    way this environment can see what that one cannot.
+    """
+
+    import subprocess
+    import sys
+
+    blocked = ("websockets", "aiohttp", "pydantic", "eth_account", "web3")
+    program = f"""
+import sys
+
+class _Blocker:
+    def find_module(self, name, path=None):
+        return self.find_spec(name, path)
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in {blocked!r}:
+            raise ImportError(f"{{name}} is not installed on the bot's host")
+        return None
+
+sys.meta_path.insert(0, _Blocker())
+
+import backtest.recording_paths
+import scripts.compact_recordings
+
+print("ok")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_backtest_package_still_exposes_its_eager_names() -> None:
+    # The lazy __getattr__ must not change the public surface.
+    import backtest
+
+    assert backtest.EventRecorder is not None
+    assert backtest.replay_file is not None
+    assert "SimConfig" in dir(backtest)
+    with pytest.raises(AttributeError):
+        backtest.does_not_exist

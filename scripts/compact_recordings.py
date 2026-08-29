@@ -13,6 +13,11 @@ housekeeping job that has no deadline. A cron entry has no such problem:
 
     5 3 * * *  cd /opt/async-futures-v2 && python -m scripts.compact_recordings
 
+Only the standard library is imported on this path — see
+:mod:`backtest.recording_paths`. Cron runs against the host interpreter, which
+has none of the bot's packages, and a nightly job that dies on an import is
+indistinguishable from one that has nothing to do.
+
 The original is removed only after the archive has been read back in full and
 its byte count matched. gzip verifies its own CRC on read, so a truncated or
 corrupt archive raises instead of silently passing — which matters, because the
@@ -34,7 +39,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backtest.replay import recording_date
+from backtest.recording_paths import recording_date
 
 logger = logging.getLogger(__name__)
 
