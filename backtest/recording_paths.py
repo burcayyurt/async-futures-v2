@@ -36,6 +36,7 @@ def recording_files(
     directory: Path | str,
     *,
     since: str | None = None,
+    until: str | None = None,
     exclude: Iterable[str] = (),
 ) -> list[Path]:
     """Recording files for a directory, in chronological order.
@@ -45,6 +46,10 @@ def recording_files(
     ``.jsonl.gz`` interleave correctly. When a day exists in both forms the
     plain file wins: compaction verifies the archive before removing its
     source, so during that window the source is the authoritative copy.
+
+    ``since`` and ``until`` are inclusive on both ends, which is what makes them
+    usable for cutting a history into the period a threshold was chosen on and a
+    period it has never seen.
     """
 
     directory = Path(directory)
@@ -54,6 +59,8 @@ def recording_files(
         for path in directory.glob(f"events-*{suffix}"):
             date = recording_date(path)
             if since is not None and date < since:
+                continue
+            if until is not None and date > until:
                 continue
             if date in dropped:
                 continue
