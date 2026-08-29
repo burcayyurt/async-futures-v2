@@ -36,7 +36,7 @@ from src.exchange.hyperliquid_ws import (
 from src.strategy.dvsla import DvslaParams, DvslaStrategy
 from src.strategy.signals import SignalSide
 
-HORIZONS = [30, 60, 300, 900]  # seconds
+HORIZONS = [30, 60, 300, 900]  # seconds; override with --horizons
 ROUND_TRIP_FEE_PCT = 0.060  # maker in + taker out, for reference
 BASELINE_RATE = 0.0002  # fraction of price ticks sampled as random entries
 CONFIDENCE_HORIZON = 60  # where the signal's edge peaks
@@ -91,11 +91,29 @@ def _summarize(label: str, samples: dict[int, list[float]]) -> dict[int, tuple]:
 
 
 def main() -> int:
+    global HORIZONS
     ap = argparse.ArgumentParser()
     ap.add_argument("directory", nargs="?", default="data/recordings")
     ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="YYYY-MM-DD",
+        help="drop a recording day. Every other study here has had to ask "
+             "whether a result survives without the sessions that produced most "
+             "of it; a forward-return mean is no different.",
+    )
+    ap.add_argument(
+        "--horizons",
+        default=",".join(str(h) for h in HORIZONS),
+        help="seconds to measure the forward return over. Widening these asks "
+             "whether the signal says anything on a timescale where the ~6 bps "
+             "round-trip fee is a small part of the move rather than most of it.",
+    )
     args = ap.parse_args()
+    HORIZONS = sorted(int(h) for h in args.horizons.split(",") if h.strip())
 
     rng = random.Random(args.seed)
     settings = HyperliquidSettings.from_env()
@@ -137,10 +155,11 @@ def main() -> int:
                 keep.append(p)
         queue.extend(keep)
 
-    files = recording_files(args.directory)
+    files = recording_files(args.directory, exclude=args.exclude)
     if args.days:
         files = files[-args.days:]
-    print(f"Files: {len(files)}   horizons: {HORIZONS}s   invert={params.invert}")
+    print(f"Files: {len(files)}   horizons: {HORIZONS}s   invert={params.invert}"
+          + (f"   excluded: {','.join(sorted(args.exclude))}" if args.exclude else ""))
 
     async def run() -> None:
         nonlocal signal_count
