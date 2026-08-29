@@ -59,12 +59,33 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("directory", nargs="?", default="data/recordings")
     ap.add_argument("--days", type=int, default=None)
+    ap.add_argument("--from", dest="since", default=None)
+    ap.add_argument("--to", dest="until", default=None)
+    ap.add_argument("--exclude", action="append", default=[], metavar="YYYY-MM-DD")
+    ap.add_argument(
+        "--time-stops",
+        default=",".join(TIME_STOPS),
+        help="hold horizons in seconds. Worth pushing well past a minute: the "
+             "signal's forward return keeps growing out to four hours once the "
+             "cascade sessions are excluded, and a longer hold is the only way "
+             "to stop competing on entry speed.",
+    )
+    ap.add_argument("--trails", default=",".join(TRAILS))
+    ap.add_argument(
+        "--maker",
+        default="true",
+        help="true (realistic post-only), false (instant fill), or both",
+    )
     args = ap.parse_args()
+
+    time_stops = [t.strip() for t in args.time_stops.split(",") if t.strip()]
+    trails = [t.strip() for t in args.trails.split(",") if t.strip()]
+    maker = {"true": [True], "false": [False], "both": [False, True]}[args.maker.lower()]
 
     settings = HyperliquidSettings.from_env()
     strategy = DvslaStrategy(DvslaParams.from_settings(settings))
 
-    combos = list(itertools.product(TIME_STOPS, TRAILS, MAKER))
+    combos = list(itertools.product(time_stops, trails, maker))
     sims = [
         BacktestSimulator(
             strategy,
@@ -82,10 +103,13 @@ def main() -> int:
         for ts, tr, mk in combos
     ]
 
-    files = recording_files(args.directory)
+    files = recording_files(
+        args.directory, since=args.since, until=args.until, exclude=args.exclude
+    )
     if args.days:
         files = files[-args.days:]
-    print(f"Files: {len(files)}   Grid: {len(combos)} (time-stop x trail x maker-fill)")
+    print(f"Files: {len(files)}   Grid: {len(combos)} (time-stop x trail x maker-fill)"
+          + (f"   excluded: {','.join(sorted(args.exclude))}" if args.exclude else ""))
     print(f"Fixed: TP=off  stop={float(settings.atr_stop_min_pct) * 100:.2f}%  "
           f"fees={float(settings.maker_fee_bps)}/{float(settings.taker_fee_bps)}bps\n")
 
@@ -113,9 +137,12 @@ def main() -> int:
     for sim in sims:
         sim._close_remaining()
 
-    print(f"{'tstop':>6} {'trail%':>7} {'maker':>6} {'fill%':>6} {'n':>5} {'win%':>5} "
-          f"{'net$':>9} {'mean$':>8} {'t':>7}  exit reasons")
-    print("-" * 96)
+    # bps alongside dollars because every other study here reports bps, and
+    # skipped because a long hold occupies one of five slots for its whole
+    # length — a horizon can look good per trade and still take far fewer.
+    print(f"{'tstop':>6} {'trail%':>7} {'maker':>6} {'fill%':>6} {'n':>5} {'skip':>6} "
+          f"{'win%':>5} {'net$':>9} {'bps':>7} {'t':>7}  exit reasons")
+    print("-" * 108)
     for (ts, tr, mk), sim in zip(combos, sims):
         nets = [float(t.net_pnl) for t in sim._result.trades]
         r = sim._result
@@ -125,6 +152,8 @@ def main() -> int:
             print(f"{ts:>6} {float(tr) * 100:7.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d}"
                   f"   (too few trades)")
             continue
+        bps = [float(t.net_pnl / t.notional * Decimal("10000"))
+               for t in r.trades if t.notional]
         mean = statistics.mean(nets)
         sd = statistics.stdev(nets)
         tstat = mean / (sd / len(nets) ** 0.5) if sd > 0 else float("nan")
@@ -133,8 +162,10 @@ def main() -> int:
         for tr_ in sim._result.trades:
             reasons[tr_.exit_reason] = reasons.get(tr_.exit_reason, 0) + 1
         reason_str = " ".join(f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
+        mean_bps = statistics.mean(bps) if bps else float("nan")
         print(f"{ts:>6} {float(tr) * 100:7.2f} {str(mk):>6} {fill_rate:6.0f} {len(nets):5d} "
-              f"{wins / len(nets) * 100:5.0f} {sum(nets):9.2f} {mean:8.4f} {tstat:+7.2f}  {reason_str}")
+              f"{r.skipped_signals:6d} {wins / len(nets) * 100:5.0f} {sum(nets):9.2f} "
+              f"{mean_bps:7.2f} {tstat:+7.2f}  {reason_str}")
     return 0
 
 
