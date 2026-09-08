@@ -58,6 +58,13 @@ FINGERPRINTED_FIELDS: tuple[str, ...] = (
     # Strategy engine
     "strategy_engine",
     "dvsla_invert",
+    # The bar definition decides what every downstream statistic is computed on:
+    # a threshold that yields one-trade, flat-price bars produces a different
+    # strategy from one that yields ten-trade bars, at identical z-score
+    # settings. Omitting these pooled runs with incomparable bar definitions
+    # under one config_id (found 2026-09-08, before the notional rescale).
+    "dvsla_volume_bar_threshold",
+    "dvsla_symbol_thresholds",
     "dvsla_ret_z_window",
     "dvsla_ret_z_entry",
     "dvsla_ret_z_clamp",
@@ -84,6 +91,11 @@ def _jsonable(value: Any) -> Any:
         return str(value.normalize())
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        # Sort by key: the same thresholds loaded from the defaults and from a
+        # DVSLA_SYMBOL_THRESHOLDS env var arrive in different insertion orders,
+        # and identical settings must fingerprint identically.
+        return {str(k): _jsonable(v) for k, v in sorted(value.items())}
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
