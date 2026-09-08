@@ -239,32 +239,71 @@ class HyperliquidSettings(BaseSettings):
     # meaningless and the tiny fallback caused thousands of micro-bars/sec).
     # Override via the DVSLA_SYMBOL_THRESHOLDS env var as a JSON object,
     # e.g. {"BTC":"40"}. Re-sweep periodically as throughput drifts.
+    # Rescaled 2026-09-08 so a bar carries enough independent trades to move the
+    # price. The old values were denominated in coin units without reference to
+    # what a coin is worth or how it trades, so a DOT bar held ~$76 and a single
+    # trade, and 83.7% of DOT bars closed at their opening price. A bar that
+    # cannot move the market enters the ret_z_window as a zero; four fifths of
+    # the window being zeros is why ret_z saturated at the clamp and
+    # ret_z_reject fired 125 times on DOT alone in 48 hours of live running.
+    #
+    # Calibrated on 2026-08-01..08-26 and checked against 2026-07-06..07-31
+    # (scripts/symbol_economics.py, section 2). Target: median 10 trades per bar
+    # -- the point where the flat-bar share settles near 20-30%, where BTC and
+    # WLD already sat. Thresholds were only ever raised, never lowered.
+    #
+    #   coin   old ->  new    flat% before -> after (Jul, out of sample)
+    #   DOT      93 -> 3100      83.7 -> 21.9    needed two passes: DOT's own
+    #   OP     1400 -> 14000     68.8 -> 31.4    trades are large relative to
+    #   LTC      11 ->  180      70.4 -> 24.8    the threshold, so 10x volume
+    #   FET    1800 -> 18000     64.1 -> 20.8    bought only 3x the trades
+    #   FIL     300 -> 1500      56.2 -> 24.8
+    #   APT     810 -> 3400      55.8 -> 27.5
+    #   LINK    150 ->  750      54.9 -> 26.8
+    #   BNB       2 ->   10      54.7 -> 26.9
+    #   BCH       3 ->   15      54.2 -> 36.0
+    #   AVAX    130 ->  650      51.5 -> 28.5
+    #   TIA    1600 -> 5300      41.2 -> 25.2
+    #   ADA   13000 -> 32000     39.8 -> 26.3
+    #   INJ     220 ->  550      32.3 -> 19.0
+    #   SUI    2900 -> 9700      46.7 -> 22.4
+    #   ATOM    420 ->  840      29.2 -> 16.9
+    #   SOL     370 ->  530      35.2 -> 29.4
+    #   SEI   36000 -> 40000     22.9 -> 11.1
+    #
+    # BTC, NEAR, WLD and XRP already met the target and are untouched. ETH, ARB
+    # and DOGE are not in BOT_SYMBOLS and were left at their old values rather
+    # than given untested ones -- do not drop them from this dict, or they fall
+    # back to dvsla_volume_bar_threshold (50) and a DOGE bar becomes ~$4.
+    #
+    # Cost of the change: total bars fall to roughly a third, so signals do too.
+    # The ones lost are those computed on windows that were mostly zeros.
     dvsla_symbol_thresholds: dict[str, Decimal] = Field(
         default_factory=lambda: {
             "WLD": Decimal("69000"),
-            "SEI": Decimal("36000"),
+            "SEI": Decimal("40000"),
+            "ADA": Decimal("32000"),
             "XRP": Decimal("25000"),
-            "ADA": Decimal("13000"),
+            "FET": Decimal("18000"),
+            "OP": Decimal("14000"),
+            "SUI": Decimal("9700"),
             "DOGE": Decimal("9400"),
+            "TIA": Decimal("5300"),
             "NEAR": Decimal("4500"),
-            "SUI": Decimal("2900"),
+            "APT": Decimal("3400"),
+            "DOT": Decimal("3100"),
             "ARB": Decimal("2800"),
-            "FET": Decimal("1800"),
-            "TIA": Decimal("1600"),
-            "OP": Decimal("1400"),
-            "APT": Decimal("810"),
-            "ETH": Decimal("400"),   # 640→400: warmup ~4sa→~2.5sa
-            "ATOM": Decimal("420"),
-            "SOL": Decimal("370"),
-            "FIL": Decimal("300"),
-            "INJ": Decimal("220"),
-            "LINK": Decimal("150"),
-            "AVAX": Decimal("130"),
-            "DOT": Decimal("93"),
-            "LTC": Decimal("11"),
+            "FIL": Decimal("1500"),
+            "ATOM": Decimal("840"),
+            "LINK": Decimal("750"),
+            "AVAX": Decimal("650"),
+            "INJ": Decimal("550"),
+            "SOL": Decimal("530"),
+            "ETH": Decimal("400"),
+            "LTC": Decimal("180"),
+            "BCH": Decimal("15"),
+            "BNB": Decimal("10"),
             "BTC": Decimal("8"),
-            "BCH": Decimal("3"),
-            "BNB": Decimal("2"),
         },
         validation_alias="DVSLA_SYMBOL_THRESHOLDS",
     )
